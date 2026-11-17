@@ -55,6 +55,7 @@ setTimeout(function () {
     <button id="dupFileBtn" title="Duplicate the open file">⧉ Dup</button>
     <span id="modelPill" class="pill down">model: checking…</span>
     <span id="updatePill" class="pill hidden" title="An update is available">⬆ update</span>
+    <span id="trustPill" class="pill hidden" title="This workspace is not trusted: agent actions, terminal and MCP tools are off">🔒 untrusted</span>
     <span id="pairChip" class="pill hidden" title="Pair mode">👥</span>
     <span id="healthDot" class="pill" title="Server health: checking…">●</span>
     <button id="startModelBtn" class="hidden">Start model</button>
@@ -78,6 +79,7 @@ setTimeout(function () {
     <div id="gitPanel">
       <div class="panel-head"><span id="gitHeadTxt">GIT</span> <span id="gitBranch" class="tag"></span> <button id="gitCopyStatus" title="Copy a one-line status summary (branch, distance, change count)">📋</button></div>
       <div id="gitChanges" class="dim">checking…</div>
+      <div id="gitMergeState" class="dim"></div>
       <div class="git-remote">
         <div class="dim">Branches</div>
         <div id="branchList" class="dim"></div>
@@ -212,6 +214,7 @@ setTimeout(function () {
       <span id="cursorPos">Ln 1, Col 1</span>
       <span id="fileType"></span>
       <button id="diagChip" class="hidden" title="Syntax problem - tap to jump to it">⚠</button>
+      <button id="lspChip" class="hidden" title="Language servers">LSP</button>
       <button id="lineDup" title="Duplicate line (Alt+D)">⧉ line</button>
       <button id="lineUp" title="Move line up (Alt+Up)">↑ line</button>
       <button id="lineDown" title="Move line down (Alt+Down)">↓ line</button>
@@ -398,6 +401,14 @@ setTimeout(function () {
   </div>
 </div>
 <button id="tourChip" class="hidden">🎓 New here? Take the 3-minute tour</button>
+<div id="trustBanner" class="hidden" role="dialog" aria-label="Workspace trust">
+  <div class="panel-head"><h3>🔒 Trust this workspace?</h3></div>
+  <p id="trustBannerBody">While a workspace is not trusted, the agent, the terminal and MCP tools stay off. Editing and reading files still work. Trust is remembered for this folder.</p>
+  <div class="row" style="display:flex;gap:8px">
+    <button id="trustNowBtn">Trust this workspace</button>
+    <button id="trustLaterBtn">Not now</button>
+  </div>
+</div>
 <div id="wsMenu" class="hidden"></div>
 <div id="findPanel" class="hidden">
   <h3 id="findTitle">Find in project</h3>
@@ -407,6 +418,7 @@ setTimeout(function () {
     <button id="findGo">Find</button>
     <button id="findSemantic" title="Meaning search: plain-English over functions, ranked by concept">🧠 Meaning</button>
     <button id="findIndexed" title="Indexed search: the real GhostIndex FTS5 index over the whole workspace, token-budgeted excerpts">🔎 Indexed</button>
+    <button id="findNeural" title="Neural search: a local embedding model ranks code chunks by meaning (needs the embedding model and a built index)">✦ Neural</button>
     <button id="findReplace">Replace all</button>
     <button id="findClose">Close</button>
   </div>
@@ -515,6 +527,7 @@ setTimeout(function () {
     <button id="toolChangelog">What's new</button>
     <button id="toolEco">Ecosystem tools</button>
     <button id="toolMcp">MCP servers</button>
+    <button id="toolModels">Model store</button>
     <button id="toolApprove">Approve queue</button>
     <button id="toolBoard">Ecosystem board</button>
     <button id="toolRecipes">Recipes shelf</button>
@@ -817,6 +830,23 @@ setTimeout(function () {
     <button id="diffDiscard" class="hidden">Discard</button>
     <button id="diffClose">✕</button></span></div>
   <pre id="diffOut"></pre>
+  <div id="diffHunks"></div>
+</div>
+
+<div id="conflictPanel" class="hidden">
+  <div class="run-head"><span id="conflictTitle">Resolve conflict</span>
+    <span><button id="conflictSave">Save resolved + stage</button>
+    <button id="conflictClose">✕</button></span></div>
+  <div id="conflictPanes">
+    <div><div class="dim">Base (common ancestor)</div><pre id="conflictBase"></pre></div>
+    <div><div class="dim">Ours (current branch)</div><pre id="conflictOurs"></pre></div>
+    <div><div class="dim">Theirs (incoming)</div><pre id="conflictTheirs"></pre></div>
+  </div>
+  <div id="conflictBlocks"></div>
+  <div class="dim">Result: use the buttons above per conflict, or edit the text by hand.</div>
+  <textarea id="conflictResult" rows="12" spellcheck="false"></textarea>
+  <div id="conflictCount" class="dim"></div>
+  <div id="conflictMsg" class="dim"></div>
 </div>
 <div id="settingsPanel" class="hidden">
   <h3>Settings</h3>
@@ -899,6 +929,7 @@ setTimeout(function () {
   <label><input type="checkbox" id="setWs"> Show whitespace</label>
   <label><input type="checkbox" id="setWrap"> Word wrap</label>
   <label><input type="checkbox" id="setDiag"> Syntax diagnostics in the editor</label>
+  <label><input type="checkbox" id="setLsp"> Language servers (LSP): hover, go to definition, completions and extra diagnostics for Python and TypeScript (desktop; Python uses Jedi, TypeScript needs Node.js)</label>
   <label><input type="checkbox" id="setFold"> Code folding gutter</label>
   <label><input type="checkbox" id="setTestOnSave"> Run related tests on save (desktop)</label>
   <label>Editor text size
@@ -985,19 +1016,35 @@ setTimeout(function () {
   <label>Model file (desktop)
     <input id="modelPath" type="text" placeholder="/path/to/model.gguf"></label>
   <button id="modelSwitch">Switch model</button>
+  <button id="modelStoreBtn">Open the model store</button>
   <p class="dim">App version <span id="setVersion">…</span>
     <button id="setUpdateBtn">Check for updates</button>
     <button id="setWhatsNew">What's new</button>
     <button id="setCopySettings">Copy settings</button>
     <button id="setClearHist">Clear on-device histories</button>
     <span id="setUpdateOut"></span></p>
+  <p class="dim" id="setUpdFlowRow">Desktop updates: <span id="setUpdFlowOut">…</span>
+    <button id="setUpdDownloadBtn">Download update</button>
+    <button id="setUpdApplyBtn">Restart to apply</button>
+    <button id="setUpdRollbackBtn">Roll back to previous</button>
+    <label><input type="checkbox" id="setUpdAutoChk"> Check on launch</label></p>
+  <p class="dim">Workspace trust: <span id="setTrustInfo">…</span>
+    <button id="setTrustBtn">Trust this workspace</button></p>
+  <p class="dim">Workspace instructions: <span id="setInstrInfo">…</span></p>
   <p class="dim">Ecosystem bundle: <span id="setEcoInfo">…</span></p>
   <p class="dim">MCP sessions: <span id="setMcpInfo">…</span> <button id="setMcpRestart" title="Drop every persistent MCP session (desktop) and clear the phone's list cache">Restart sessions</button></p>
   <p class="dim">Paired devices: <span id="setPairInfo">…</span></p>
   <p class="dim">This build: <span id="setAbout">…</span></p>
+  <p class="dim">llama.cpp runtime (the AI engine, about 18 MB, not in the package - downloaded once, on first use):
+    <span id="setLlamaDlOut"></span>
+    <button id="setLlamaDlBtn">Download llama.cpp</button></p>
   <p class="dim">Desktop AI model (Qwen2.5-Coder-7B, 4.7 GB, optional):
     <span id="setModelDlOut"></span>
     <button id="setModelDlBtn">Download 7B model</button></p>
+  <p class="dim">Neural search model (nomic-embed-text-v1.5, about 139 MB, optional - powers the Find panel's Neural mode and the agent's SEMANTIC action; the lexical Meaning search works without it):
+    <span id="setEmbedDlOut"></span>
+    <button id="setEmbedDlBtn">Download embedding model</button>
+    <button id="setEmbedBuildBtn">Build neural index</button></p>
   <button id="settingsClose">Close</button>
 </div>
 <nav id="viewBar" aria-label="View switcher">

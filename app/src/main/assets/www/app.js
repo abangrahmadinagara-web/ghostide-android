@@ -32970,7 +32970,8 @@
       attachSelection: true,
       attachDiff: false,
       agentRepairRounds: 3,
-      agentMaxSteps: 50
+      agentMaxSteps: 50,
+      lsp: true
     },
     JSON.parse(localStorage.getItem("ghostide-settings") || "{}")
   );
@@ -33161,6 +33162,18 @@
       wsComp.of(wsExt()),
       diagComp.of(diagExt()),
       foldComp.of(foldExt()),
+      /* Desktop Cycle 2 (D4): LSP hover, completion and
+         go-to-definition (F12). The three factories are
+         hoisted function declarations further down (the
+         TDZ rule): constructing the extensions here only
+         stores the references; they run on user input,
+         long after the module has fully loaded. */
+      lspHoverExt(),
+      lspCompletionExt(),
+      keymap.of([{ key: "F12", run: (v) => {
+        lspGoToDefinition(v);
+        return true;
+      } }]),
       keymap.of(foldKeymap),
       EditorView.updateListener.of((u) => {
         if (u.selectionSet || u.docChanged) {
@@ -33195,6 +33208,7 @@
           }
           if (currentFile) queueDraftSave();
           if (currentFile) queueDiagnostics();
+          if (currentFile) queueLspChange();
           if (currentFile) queueAutosave();
         }
       })
@@ -33593,6 +33607,7 @@
     if (p === splitFile) closeSplit();
     const isDirty = p === currentFile ? dirty : !!tabDirty.get(p);
     if (isDirty && !confirm("Close " + p + " with unsaved changes?")) return;
+    lspCloseFile(p);
     tabOrder.splice(i2, 1);
     closedStack.push(p);
     tabStates.delete(p);
@@ -33635,6 +33650,7 @@
     stashTab();
     if (tabStates.has(path)) {
       activateTab(path);
+      lspOpenFile(path, tabStates.get(path).doc.toString());
       maybeDataView(path, null);
       return;
     }
@@ -33653,6 +33669,7 @@
     tabDirty.set(path, false);
     pairNoteOpened(path, d.content);
     activateTab(path);
+    lspOpenFile(path, d.content);
     maybeDataView(path, d.content);
     checkDraft(path, d.content);
     checkQuiet();
@@ -33759,38 +33776,364 @@
         content: view.state.doc.toString()
       });
       if (path !== currentFile) return;
-      let diags = [];
-      diagProblem = null;
+      syntaxDiags = [];
       if (d && d.ok === false && d.line) {
         const ln = Math.max(
           1,
           Math.min(d.line, view.state.doc.lines)
         );
         const line = view.state.doc.line(ln);
-        diags = [{
+        syntaxDiags = [{
           from: line.from,
           to: line.to,
           severity: "error",
           message: d.message || "syntax problem"
         }];
-        diagProblem = {
-          line: ln,
-          message: d.message || "syntax problem"
-        };
       }
-      view.dispatch(setDiagnostics(view.state, diags));
-      if (chip) {
-        if (diagProblem) {
-          chip.textContent = "\u26A0 line " + diagProblem.line;
-          chip.title = diagProblem.message;
-          chip.classList.remove("hidden");
-        } else {
-          chip.classList.add("hidden");
-        }
+      applyDiagnostics();
+    } catch (e) {
+    }
+  }
+  var syntaxDiags = [];
+  var lspDiagsByPath = {};
+  var lspOpenPaths = /* @__PURE__ */ new Set();
+  var lspChangeTimer = null;
+  var LSP_EXTS = {
+    ".py": "python",
+    ".js": "typescript",
+    ".mjs": "typescript",
+    ".cjs": "typescript",
+    ".jsx": "typescript",
+    ".ts": "typescript",
+    ".mts": "typescript",
+    ".cts": "typescript",
+    ".tsx": "typescript"
+  };
+  var LSP_KINDS = {
+    1: "text",
+    2: "method",
+    3: "function",
+    4: "function",
+    5: "property",
+    6: "variable",
+    7: "class",
+    8: "interface",
+    9: "namespace",
+    10: "property",
+    11: "variable",
+    13: "variable",
+    14: "keyword",
+    15: "snippet",
+    17: "file",
+    18: "text",
+    21: "variable",
+    22: "class"
+  };
+  var LSP_SEVERITIES = {
+    1: "error",
+    2: "warning",
+    3: "info",
+    4: "hint"
+  };
+  function lspLangFor(path) {
+    const m = /\.(\w+)$/.exec(path || "");
+    return m ? LSP_EXTS["." + m[1].toLowerCase()] || null : null;
+  }
+  function lspEnabled() {
+    return settings.lsp !== false;
+  }
+  function applyDiagnostics() {
+    const chip = $("diagChip");
+    if (!currentFile) return;
+    if (settings.diag === false) {
+      view.dispatch(setDiagnostics(view.state, []));
+      diagProblem = null;
+      if (chip) chip.classList.add("hidden");
+      return;
+    }
+    const doc2 = view.state.doc;
+    const out = syntaxDiags.slice();
+    for (const d of lspDiagsByPath[currentFile] || []) {
+      try {
+        const s = d.range.start, e = d.range.end;
+        const sl = Math.min(
+          Math.max(1, s.line + 1),
+          doc2.lines
+        );
+        const el = Math.min(
+          Math.max(1, e.line + 1),
+          doc2.lines
+        );
+        const from = Math.min(
+          doc2.line(sl).from + s.character,
+          doc2.line(sl).to
+        );
+        const to = Math.max(from, Math.min(
+          doc2.line(el).from + e.character,
+          doc2.line(el).to
+        ));
+        out.push({
+          from,
+          to,
+          severity: LSP_SEVERITIES[d.severity] || "error",
+          message: (d.source ? d.source + ": " : "") + (d.message || "problem")
+        });
+      } catch (err) {
+      }
+    }
+    view.dispatch(setDiagnostics(view.state, out));
+    if (chip) {
+      if (out.length) {
+        const first = out[0];
+        const ln = doc2.lineAt(
+          Math.min(first.from, doc2.length)
+        ).number;
+        diagProblem = { line: ln, message: first.message };
+        chip.textContent = out.length > 1 ? "\u26A0 " + out.length + " problems" : "\u26A0 line " + ln;
+        chip.title = first.message;
+        chip.classList.remove("hidden");
+      } else {
+        diagProblem = null;
+        chip.classList.add("hidden");
+      }
+    }
+  }
+  async function lspOpenFile(path, content2) {
+    if (!lspEnabled() || !lspLangFor(path) || lspOpenPaths.has(path)) return;
+    lspOpenPaths.add(path);
+    try {
+      await postJson(
+        "/api/lsp/open",
+        { path, content: content2 }
+      );
+      lspFetchDiagnostics(path);
+    } catch (e) {
+    }
+    lspRefreshStatus();
+  }
+  function queueLspChange() {
+    if (!lspEnabled() || !currentFile || !lspOpenPaths.has(currentFile)) return;
+    clearTimeout(lspChangeTimer);
+    lspChangeTimer = setTimeout(async () => {
+      const path = currentFile;
+      if (!path || !lspOpenPaths.has(path)) return;
+      try {
+        await postJson("/api/lsp/change", {
+          path,
+          content: view.state.doc.toString()
+        });
+      } catch (e) {
+      }
+      setTimeout(() => lspFetchDiagnostics(path), 500);
+    }, 900);
+  }
+  async function lspFetchDiagnostics(path) {
+    if (!lspEnabled() || !lspLangFor(path)) return;
+    try {
+      const d = await getJson("/api/lsp/diagnostics?path=" + encodeURIComponent(path));
+      if (d && d.files) {
+        lspDiagsByPath[path] = d.files[path] || [];
+        if (path === currentFile) applyDiagnostics();
       }
     } catch (e) {
     }
   }
+  function lspDidSave(path) {
+    if (lspEnabled() && lspOpenPaths.has(path))
+      postJson("/api/lsp/save", { path }).catch(() => {
+      });
+  }
+  function lspCloseFile(path) {
+    if (!lspOpenPaths.has(path)) return;
+    lspOpenPaths.delete(path);
+    delete lspDiagsByPath[path];
+    postJson("/api/lsp/close", { path }).catch(() => {
+    });
+  }
+  setInterval(() => {
+    if (currentFile && lspOpenPaths.has(currentFile))
+      lspFetchDiagnostics(currentFile);
+  }, 3e3);
+  function lspWordAt(doc2, pos) {
+    const line = doc2.lineAt(pos);
+    const text = line.text;
+    let a = pos - line.from, b = a;
+    while (a > 0 && /[\w$]/.test(text[a - 1])) a--;
+    while (b < text.length && /[\w$]/.test(text[b])) b++;
+    return { from: line.from + a, to: line.from + b };
+  }
+  function lspHoverExt() {
+    return hoverTooltip(async (viewArg, pos) => {
+      if (!lspEnabled() || !currentFile || !lspLangFor(currentFile)) return null;
+      const path = currentFile;
+      const line = viewArg.state.doc.lineAt(pos);
+      try {
+        const d = await postJson("/api/lsp/hover", {
+          path,
+          line: line.number - 1,
+          character: pos - line.from
+        });
+        if (!d || !d.result || path !== currentFile)
+          return null;
+        const c = d.result.contents;
+        let text = "";
+        if (typeof c === "string") text = c;
+        else if (Array.isArray(c))
+          text = c.map((x) => typeof x === "string" ? x : x && x.value || "").join("\n");
+        else if (c && c.value) text = c.value;
+        if (!text.trim()) return null;
+        const word = lspWordAt(viewArg.state.doc, pos);
+        return {
+          pos,
+          end: word.to,
+          above: true,
+          create() {
+            const dom = document.createElement("div");
+            dom.className = "lsp-hover";
+            dom.textContent = text.slice(0, 2e3);
+            return { dom };
+          }
+        };
+      } catch (e) {
+        return null;
+      }
+    }, { hoverTime: 600 });
+  }
+  function lspCompletionExt() {
+    return autocompletion({
+      override: [lspCompletionSource],
+      maxRenderedOptions: 40
+    });
+  }
+  async function lspCompletionSource(context) {
+    if (!lspEnabled() || !currentFile || !lspLangFor(currentFile)) return null;
+    const word = context.matchBefore(/[\w$]+/);
+    if (!context.explicit && !word) return null;
+    const path = currentFile;
+    const line = context.state.doc.lineAt(context.pos);
+    try {
+      const d = await postJson("/api/lsp/completion", {
+        path,
+        line: line.number - 1,
+        character: context.pos - line.from
+      });
+      if (!d || !d.result || path !== currentFile)
+        return null;
+      const items = Array.isArray(d.result) ? d.result : d.result.items || [];
+      const options = [];
+      for (const it of items.slice(0, 200)) {
+        if (!it || !it.label) continue;
+        const opt = {
+          label: String(it.label),
+          type: LSP_KINDS[it.kind] || "text"
+        };
+        if (it.detail)
+          opt.detail = String(it.detail).slice(0, 80);
+        const insert2 = it.textEdit && it.textEdit.newText || it.insertText || it.label;
+        if (insert2 !== it.label) opt.apply = String(insert2);
+        options.push(opt);
+      }
+      if (!options.length) return null;
+      return {
+        from: word ? word.from : context.pos,
+        options,
+        validFor: /^[\w$]*$/
+      };
+    } catch (e) {
+      return null;
+    }
+  }
+  function lspJumpTo(loc) {
+    const doc2 = view.state.doc;
+    const ln = Math.min(
+      Math.max(1, loc.line + 1),
+      doc2.lines
+    );
+    const lineObj = doc2.line(ln);
+    const anchor = Math.min(
+      lineObj.from + (loc.character || 0),
+      lineObj.to
+    );
+    view.dispatch({
+      selection: { anchor },
+      scrollIntoView: true
+    });
+    view.focus();
+  }
+  async function lspGoToDefinition(viewArg) {
+    if (!lspEnabled() || !currentFile || !lspLangFor(currentFile)) return;
+    const path = currentFile;
+    const pos = viewArg.state.selection.main.head;
+    const line = viewArg.state.doc.lineAt(pos);
+    try {
+      const d = await postJson("/api/lsp/definition", {
+        path,
+        line: line.number - 1,
+        character: pos - line.from
+      });
+      const locs = d && d.locations || [];
+      if (!locs.length) {
+        setSaveState("no definition found");
+        return;
+      }
+      const loc = locs[0];
+      if (loc.path === path) lspJumpTo(loc);
+      else {
+        await openFile(loc.path);
+        lspJumpTo(loc);
+      }
+    } catch (e) {
+    }
+  }
+  async function lspRefreshStatus() {
+    const chip = $("lspChip");
+    if (!chip) return;
+    if (!lspEnabled()) {
+      chip.classList.add("hidden");
+      return;
+    }
+    try {
+      const d = await getJson("/api/lsp/status");
+      const parts = [];
+      let label = "LSP";
+      for (const key of ["python", "typescript"]) {
+        const s = d.servers && d.servers[key];
+        if (!s) continue;
+        parts.push(s.server + ": " + s.state + (s.detail ? " (" + s.detail + ")" : ""));
+        if (s.state === "ready") label = "LSP \u2713";
+        else if (s.state === "installing" && label === "LSP") label = "LSP installing\u2026";
+        else if ((s.state === "crashed" || s.state === "install-failed") && label !== "LSP installing\u2026")
+          label = "LSP \u26A0";
+      }
+      chip.textContent = label;
+      chip.title = "Language servers\n" + parts.join("\n") + "\nClick to install or restart a server that needs it.";
+      chip.classList.remove("hidden");
+    } catch (e) {
+      chip.classList.add("hidden");
+    }
+  }
+  async function lspChipAction() {
+    try {
+      const d = await getJson("/api/lsp/status");
+      for (const key of ["python", "typescript"]) {
+        const s = d.servers && d.servers[key];
+        if (!s) continue;
+        if (s.state === "not-installed" || s.state === "install-failed")
+          await postJson(
+            "/api/lsp/install",
+            { language: key }
+          );
+        else if (s.state === "crashed")
+          await postJson(
+            "/api/lsp/restart",
+            { language: key }
+          );
+      }
+    } catch (e) {
+    }
+    setTimeout(lspRefreshStatus, 600);
+  }
+  setInterval(lspRefreshStatus, 1e4);
   async function saveFile() {
     if (!currentFile) return;
     if (settings.trimOnSave) {
@@ -33816,6 +34159,7 @@
       })
     });
     pairNoteSaved();
+    lspDidSave(currentFile);
     dirty = false;
     tabDirty.set(currentFile, false);
     renderTabs();
@@ -33920,6 +34264,10 @@
   $("settingsBtn").onclick = () => {
     $("settingsPanel").classList.toggle("hidden");
     refreshModelDl();
+    refreshLlamaDl();
+    refreshEmbedDl();
+    refreshTrustUI(false);
+    refreshUpdateFlow();
   };
   $("settingsClose").onclick = () => $("settingsPanel").classList.add("hidden");
   {
@@ -34001,6 +34349,143 @@
       out.textContent = "check failed (offline?)";
     }
   };
+  var trustState = null;
+  async function refreshTrustUI(promptIfNeeded) {
+    try {
+      const r = await fetch("/api/trust");
+      const d = await r.json();
+      if (!d || typeof d.trusted !== "boolean") {
+        trustState = null;
+        $("trustPill").classList.add("hidden");
+        $("trustBanner").classList.add("hidden");
+        return;
+      }
+      trustState = d;
+      const pill = $("trustPill");
+      const banner = $("trustBanner");
+      if (d.trusted) {
+        pill.classList.add("hidden");
+        banner.classList.add("hidden");
+      } else {
+        pill.classList.remove("hidden");
+        if (promptIfNeeded && d.decision === null)
+          banner.classList.remove("hidden");
+      }
+      const info = $("setTrustInfo");
+      if (info) info.textContent = d.trusted ? "trusted (agent, terminal and MCP tools are on)" : "not trusted: agent actions, terminal and MCP tools are off for this folder";
+      const tbtn = $("setTrustBtn");
+      if (tbtn) tbtn.classList.toggle("hidden", !!d.trusted);
+    } catch (e) {
+    }
+    refreshInstrUI();
+  }
+  async function refreshInstrUI() {
+    try {
+      const r = await fetch("/api/instructions");
+      const d = await r.json();
+      const info = $("setInstrInfo");
+      if (!info) return;
+      if (d && d.files && d.files.length)
+        info.textContent = d.files.map(
+          (f) => f.rel + " (" + f.chars + " chars, in the agent's system context)"
+        ).join(", ");
+      else
+        info.textContent = "none (no AGENTS.md in this workspace)";
+    } catch (e) {
+    }
+  }
+  async function setTrust(trusted) {
+    try {
+      await postJson("/api/trust", { trusted });
+    } catch (e) {
+    }
+    $("trustBanner").classList.add("hidden");
+    refreshTrustUI(false);
+  }
+  $("trustNowBtn").onclick = () => setTrust(true);
+  $("trustLaterBtn").onclick = () => setTrust(false);
+  $("trustPill").onclick = () => $("trustBanner").classList.remove("hidden");
+  $("setTrustBtn").onclick = () => setTrust(true);
+  async function refreshUpdateFlow() {
+    const row = $("setUpdFlowRow");
+    try {
+      const r = await fetch("/api/update/status");
+      const d = await r.json();
+      if (!d || d.mode !== "packaged") {
+        if (row) row.classList.add("hidden");
+        return;
+      }
+      if (row) row.classList.remove("hidden");
+      const out = $("setUpdFlowOut");
+      const dl = d.download || {};
+      let txt = "v" + d.current + ". ";
+      if (d.pendingApply)
+        txt += "Update v" + (d.staged ? d.staged.version : "") + " is staged: restart GhostIDE to apply it. ";
+      else if (d.staged)
+        txt += "v" + d.staged.version + " downloaded and verified, ready to apply on restart. ";
+      else if (dl.state === "downloading")
+        txt += "downloading v" + dl.version + "\u2026 " + Math.round(100 * (dl.done || 0) / (dl.total || 1)) + "% ";
+      else if (dl.state === "verifying")
+        txt += "verifying the download checksum\u2026 ";
+      else if (dl.state === "error")
+        txt += "last download failed: " + dl.error + " ";
+      else if (d.lastCheck && d.lastCheck.updateAvailable)
+        txt += "v" + d.lastCheck.latest + " is available. ";
+      else if (d.lastResult)
+        txt += "(" + d.lastResult + ") ";
+      else
+        txt += "No update staged. ";
+      if (d.backupAvailable)
+        txt += "A previous version is kept for rollback.";
+      out.textContent = txt;
+      $("setUpdApplyBtn").disabled = !d.staged || !!d.pendingApply;
+      $("setUpdRollbackBtn").disabled = !d.backupAvailable;
+      $("setUpdAutoChk").checked = !d.settings || d.settings.checkOnLaunch !== false;
+    } catch (e) {
+      if (row) row.classList.add("hidden");
+    }
+  }
+  $("setUpdDownloadBtn").onclick = async () => {
+    try {
+      await postJson("/api/update/download", {});
+    } catch (e) {
+    }
+    refreshUpdateFlow();
+    setTimeout(refreshUpdateFlow, 1500);
+    setTimeout(refreshUpdateFlow, 5e3);
+  };
+  $("setUpdApplyBtn").onclick = async () => {
+    try {
+      await postJson("/api/update/apply", {});
+      $("setUpdFlowOut").textContent = "Staged. Restart GhostIDE to apply the update.";
+    } catch (e) {
+    }
+    refreshUpdateFlow();
+  };
+  $("setUpdRollbackBtn").onclick = async () => {
+    try {
+      await postJson("/api/update/rollback", {});
+      $("setUpdFlowOut").textContent = "Rollback staged. Restart GhostIDE to go back.";
+    } catch (e) {
+    }
+    refreshUpdateFlow();
+  };
+  $("setUpdAutoChk").onchange = async (e) => {
+    try {
+      await postJson(
+        "/api/update/settings",
+        { checkOnLaunch: !!e.target.checked }
+      );
+    } catch (e2) {
+    }
+  };
+  setTimeout(
+    () => {
+      refreshTrustUI(true);
+      refreshUpdateFlow();
+    },
+    1200
+  );
   var modelDlTimer = null;
   async function refreshModelDl() {
     try {
@@ -34048,6 +34533,417 @@
     }
     refreshModelDl();
   };
+  var llamaDlTimer = null;
+  async function refreshLlamaDl() {
+    try {
+      const r = await fetch("/api/llama/download");
+      const d = await r.json();
+      const out = $("setLlamaDlOut");
+      const btn = $("setLlamaDlBtn");
+      if (d.present) {
+        out.textContent = "ready \u2713 (" + d.path + ")";
+        btn.classList.add("hidden");
+      } else if (d.state === "downloading") {
+        btn.classList.remove("hidden");
+        out.textContent = "downloading\u2026 " + Math.round(100 * (d.done || 0) / (d.total || 1)) + "% of " + Math.round((d.bytes || 0) / 1048576) + " MB";
+        btn.textContent = "Downloading\u2026";
+      } else if (d.state === "verifying") {
+        btn.classList.remove("hidden");
+        out.textContent = "verifying checksum\u2026";
+        btn.textContent = "Verifying\u2026";
+      } else if (d.state === "error") {
+        btn.classList.remove("hidden");
+        out.textContent = "error: " + d.error;
+        btn.textContent = "Retry download";
+      } else {
+        btn.classList.remove("hidden");
+        out.textContent = "not downloaded yet - the editor works without it; the AI waits for this one-time download (goes to " + d.path + ")";
+        btn.textContent = "Download llama.cpp";
+      }
+      if (d.state === "downloading" || d.state === "verifying") {
+        if (!llamaDlTimer)
+          llamaDlTimer = setInterval(refreshLlamaDl, 2e3);
+      } else if (llamaDlTimer) {
+        clearInterval(llamaDlTimer);
+        llamaDlTimer = null;
+      }
+    } catch (e) {
+    }
+  }
+  $("setLlamaDlBtn").onclick = async () => {
+    const d = await postJson("/api/llama/download", {});
+    if (d.error) {
+      alert(d.error);
+      return;
+    }
+    refreshLlamaDl();
+  };
+  var embedDlTimer = null;
+  async function refreshEmbedDl() {
+    try {
+      const r = await fetch("/api/embed/download");
+      const d = await r.json();
+      const out = $("setEmbedDlOut");
+      const btn = $("setEmbedDlBtn");
+      if (d.downloaded) {
+        out.textContent = "downloaded \u2713 (" + d.path + ")";
+        btn.textContent = "Download again";
+      } else if (d.state === "downloading") {
+        out.textContent = "downloading\u2026 " + Math.round(100 * (d.done || 0) / (d.total || 1)) + "% of about 139 MB";
+        btn.textContent = "Downloading\u2026";
+      } else if (d.state === "verifying") {
+        out.textContent = "verifying checksum\u2026";
+        btn.textContent = "Verifying\u2026";
+      } else if (d.state === "error") {
+        out.textContent = "error: " + d.error;
+        btn.textContent = "Retry download";
+      } else {
+        out.textContent = "not downloaded (goes to " + d.modelsDir + ")";
+        btn.textContent = "Download embedding model";
+      }
+      if (d.state === "downloading" || d.state === "verifying") {
+        if (!embedDlTimer)
+          embedDlTimer = setInterval(refreshEmbedDl, 2e3);
+      } else if (embedDlTimer) {
+        clearInterval(embedDlTimer);
+        embedDlTimer = null;
+      }
+    } catch (e) {
+    }
+  }
+  $("setEmbedDlBtn").onclick = async () => {
+    const d = await postJson("/api/embed/download", {});
+    if (d.error) {
+      alert(d.error);
+      return;
+    }
+    refreshEmbedDl();
+  };
+  $("setEmbedBuildBtn").onclick = async () => {
+    const d = await postJson("/api/embed/build", {});
+    if (d.error) {
+      alert(d.error);
+      return;
+    }
+    alert("Neural index build started. Progress shows in the Find panel's Neural mode and in Settings.");
+  };
+  var modelsStoreTimer = null;
+  function fmtGB(bytes) {
+    if (bytes === null || bytes === void 0) return "?";
+    if (bytes >= 1e9) return (bytes / 1e9).toFixed(1) + " GB";
+    if (bytes >= 1e6) return Math.round(bytes / 1e6) + " MB";
+    return Math.max(1, Math.round(bytes / 1e3)) + " KB";
+  }
+  function fitText(fit) {
+    if (fit === "fits") return "Fits this machine";
+    if (fit === "tight") return "Tight on this machine";
+    if (fit === "too-big") return "Too big for this machine";
+    return "Fit on this machine is unknown";
+  }
+  function msNote(box, text) {
+    const d = document.createElement("div");
+    d.className = "dim";
+    d.textContent = text;
+    box.appendChild(d);
+    return d;
+  }
+  function msBtn(label, fn) {
+    const b = document.createElement("button");
+    b.className = "ghostbtn";
+    b.textContent = label;
+    b.onclick = fn;
+    return b;
+  }
+  function msBar(box, percent2) {
+    const bar = document.createElement("div");
+    bar.className = "modelbar";
+    const fill = document.createElement("div");
+    fill.className = "modelbarfill";
+    fill.style.width = Math.max(0, Math.min(100, percent2)) + "%";
+    bar.appendChild(fill);
+    box.appendChild(bar);
+  }
+  async function msPost(path, body) {
+    try {
+      return await postJson(path, body || {});
+    } catch (e) {
+      return { error: "could not reach the server" };
+    }
+  }
+  async function openModelsPanel() {
+    hideTools();
+    $("settingsPanel").classList.add("hidden");
+    $("todoTitle").textContent = "Model store";
+    $("todoResults").textContent = "Loading the model store\u2026";
+    $("todoPanel").classList.remove("hidden");
+    await renderModelsStore();
+  }
+  var toolModelsBtn = $("toolModels");
+  if (toolModelsBtn)
+    toolModelsBtn.onclick = () => {
+      openModelsPanel();
+    };
+  $("modelStoreBtn").onclick = () => {
+    openModelsPanel();
+  };
+  function modelStoreCard(box, m) {
+    const card = document.createElement("div");
+    card.className = "modelcard";
+    const title = document.createElement("div");
+    title.className = "mc-title";
+    title.appendChild(document.createTextNode(m.name));
+    const badges = [];
+    if (m.recommended) badges.push("Recommended for this machine");
+    if (m.active) badges.push("Active chat model");
+    if (m.kind === "imported") badges.push("Imported by you");
+    for (const t2 of badges) {
+      const s = document.createElement("span");
+      s.className = "mc-badge";
+      s.textContent = t2;
+      title.appendChild(s);
+    }
+    card.appendChild(title);
+    const bits = [];
+    if (m.role === "embedding") bits.push("Embedding model");
+    if (m.params) bits.push(m.params);
+    if (m.quant) bits.push(m.quant);
+    bits.push(fmtGB(m.bytes) + " download");
+    if (m.ramGB)
+      bits.push("about " + m.ramGB + " GB of RAM to run (estimate)");
+    msNote(card, bits.join(" \xB7 "));
+    if (m.blurb) msNote(card, m.blurb);
+    if (m.role === "chat" || m.role === "embedding")
+      msNote(card, fitText(m.fit) + ".");
+    const actions = document.createElement("div");
+    actions.className = "mc-actions";
+    card.appendChild(actions);
+    const dl = m.download;
+    const rerender = () => {
+      renderModelsStore();
+    };
+    if (dl && dl.state === "downloading") {
+      msBar(card, dl.percent);
+      msNote(card, "Downloading\u2026 " + Math.round(dl.percent) + "% \xB7 " + fmtGB(dl.done) + " of " + fmtGB(dl.total));
+      actions.appendChild(msBtn("Pause", async () => {
+        await msPost("/api/models/pause", { id: m.id });
+        rerender();
+      }));
+      actions.appendChild(msBtn("Cancel", async () => {
+        await msPost("/api/models/cancel", { id: m.id });
+        rerender();
+      }));
+    } else if (dl && dl.state === "paused") {
+      msBar(card, dl.percent);
+      msNote(card, "Paused at " + Math.round(dl.percent) + "%. The partial file is kept; Download resumes where it left off.");
+      actions.appendChild(msBtn("Resume download", async () => {
+        await msPost("/api/models/download", { id: m.id });
+        rerender();
+      }));
+      actions.appendChild(msBtn("Cancel", async () => {
+        await msPost("/api/models/cancel", { id: m.id });
+        rerender();
+      }));
+    } else if (dl && dl.state === "verifying") {
+      msNote(card, "Verifying the download checksum\u2026");
+    } else if (dl && dl.state === "error") {
+      msNote(card, "Download error: " + (dl.error || "unknown"));
+      actions.appendChild(msBtn("Download again", async () => {
+        await msPost("/api/models/download", { id: m.id });
+        rerender();
+      }));
+    }
+    if (m.installed) {
+      if (m.role === "chat" && !m.active)
+        actions.appendChild(msBtn("Use as chat model", async () => {
+          const d = await msPost(
+            "/api/models/active",
+            { id: m.id }
+          );
+          if (d.error) {
+            alert(d.error);
+            return;
+          }
+          pollHealth();
+          rerender();
+        }));
+      if (m.role === "embedding")
+        actions.appendChild(msBtn("Build neural index", async () => {
+          const d = await msPost("/api/embed/build", {});
+          if (d.error) {
+            alert(d.error);
+            return;
+          }
+          alert("Neural index build started. Progress shows in the Find panel's Neural mode.");
+        }));
+      actions.appendChild(msBtn("Delete", async () => {
+        let d = await msPost(
+          "/api/models/delete",
+          { id: m.id }
+        );
+        if (d && d.code === "model-loaded") {
+          if (!confirm("This model is loaded and running. Stop it and delete the file?"))
+            return;
+          d = await msPost(
+            "/api/models/delete",
+            { id: m.id, stop: true }
+          );
+        }
+        if (d && d.error) {
+          alert(d.error);
+          return;
+        }
+        pollHealth();
+        rerender();
+      }));
+    } else if (!dl || dl.state !== "downloading" && dl.state !== "paused" && dl.state !== "verifying") {
+      actions.appendChild(msBtn("Download", async () => {
+        const d = await msPost(
+          "/api/models/download",
+          { id: m.id }
+        );
+        if (d && d.error) {
+          alert(d.error);
+          return;
+        }
+        rerender();
+      }));
+    }
+    box.appendChild(card);
+  }
+  async function renderModelsStore() {
+    const box = $("todoResults");
+    if (!box || $("todoTitle").textContent !== "Model store")
+      return;
+    let d;
+    try {
+      d = await (await fetch("/api/models/store")).json();
+    } catch (e) {
+      box.textContent = "Could not reach the server.";
+      return;
+    }
+    if (d.error) {
+      box.textContent = d.error;
+      return;
+    }
+    const typed = {};
+    for (const el of box.querySelectorAll("input[data-ms]"))
+      typed[el.getAttribute("data-ms")] = el.value;
+    box.textContent = "";
+    const ram = d.machine && d.machine.ramGB;
+    msNote(box, ram ? "This machine has about " + ram.toFixed(1) + " GB of RAM. Fit marks are guidance from the estimates on each card; nothing is blocked by them." : "This machine's RAM could not be read, so no fit guidance is shown.");
+    if (d.disk)
+      msNote(box, "Models on disk: " + fmtGB(d.disk.modelsBytes) + (d.disk.freeBytes !== null && d.disk.freeBytes !== void 0 ? " \xB7 free space where models live: " + fmtGB(d.disk.freeBytes) : "") + " \xB7 folder: " + d.disk.modelsDir);
+    for (const m of d.models || [])
+      modelStoreCard(box, m);
+    const ih = document.createElement("h4");
+    ih.textContent = "Add your own GGUF";
+    box.appendChild(ih);
+    msNote(box, "Import a GGUF file from this machine or from a web address. GhostIDE checks the file starts with the GGUF header and records its SHA-256. Imported models are labelled Imported by you; where a file came from is not verified by GhostIDE.");
+    const nameIn = document.createElement("input");
+    nameIn.type = "text";
+    nameIn.placeholder = "display name (optional)";
+    nameIn.setAttribute("data-ms", "name");
+    nameIn.value = typed.name || "";
+    box.appendChild(nameIn);
+    const pathIn = document.createElement("input");
+    pathIn.type = "text";
+    pathIn.placeholder = "/path/to/model.gguf";
+    pathIn.setAttribute("data-ms", "path");
+    pathIn.value = typed.path || "";
+    box.appendChild(pathIn);
+    const prow = document.createElement("div");
+    prow.className = "mc-actions";
+    prow.appendChild(msBtn("Import file", async () => {
+      const dd = await msPost(
+        "/api/models/import",
+        {
+          path: pathIn.value.trim(),
+          name: nameIn.value.trim()
+        }
+      );
+      if (dd.error) {
+        alert(dd.error);
+        return;
+      }
+      renderModelsStore();
+    }));
+    box.appendChild(prow);
+    const urlIn = document.createElement("input");
+    urlIn.type = "text";
+    urlIn.placeholder = "https://example.com/model.gguf";
+    urlIn.setAttribute("data-ms", "url");
+    urlIn.value = typed.url || "";
+    box.appendChild(urlIn);
+    const urow = document.createElement("div");
+    urow.className = "mc-actions";
+    urow.appendChild(msBtn("Import from address", async () => {
+      const dd = await msPost(
+        "/api/models/import",
+        {
+          url: urlIn.value.trim(),
+          name: nameIn.value.trim()
+        }
+      );
+      if (dd.error) {
+        alert(dd.error);
+        return;
+      }
+      renderModelsStore();
+    }));
+    box.appendChild(urow);
+    const imp = d.import || {};
+    if (imp.state === "downloading") {
+      msBar(box, imp.percent);
+      msNote(box, "Importing " + (imp.name || "model") + "\u2026 " + Math.round(imp.percent) + "% \xB7 " + fmtGB(imp.done) + (imp.total ? " of " + fmtGB(imp.total) : ""));
+      const crow = document.createElement("div");
+      crow.className = "mc-actions";
+      crow.appendChild(msBtn("Cancel import", async () => {
+        await msPost("/api/models/cancel", { id: "import" });
+        renderModelsStore();
+      }));
+      box.appendChild(crow);
+    } else if (imp.state === "paused") {
+      msNote(box, "Import paused at " + Math.round(imp.percent) + "%. The partial file is kept.");
+      const rrow = document.createElement("div");
+      rrow.className = "mc-actions";
+      rrow.appendChild(msBtn("Resume import", async () => {
+        const dd = await msPost(
+          "/api/models/import",
+          { url: imp.origin, name: imp.name }
+        );
+        if (dd.error) {
+          alert(dd.error);
+          return;
+        }
+        renderModelsStore();
+      }));
+      rrow.appendChild(msBtn("Cancel import", async () => {
+        await msPost("/api/models/cancel", { id: "import" });
+        renderModelsStore();
+      }));
+      box.appendChild(rrow);
+    } else if (imp.state === "error") {
+      msNote(box, "Import error: " + (imp.error || "unknown"));
+    }
+    let active = imp.state === "downloading" || imp.state === "verifying";
+    for (const m of d.models || [])
+      if (m.download && (m.download.state === "downloading" || m.download.state === "verifying"))
+        active = true;
+    if (active) {
+      if (!modelsStoreTimer)
+        modelsStoreTimer = setInterval(() => {
+          if ($("todoPanel").classList.contains("hidden") || $("todoTitle").textContent !== "Model store") {
+            clearInterval(modelsStoreTimer);
+            modelsStoreTimer = null;
+            return;
+          }
+          renderModelsStore();
+        }, 2e3);
+    } else if (modelsStoreTimer) {
+      clearInterval(modelsStoreTimer);
+      modelsStoreTimer = null;
+    }
+  }
   function shortModelLabel(modelName) {
     const name2 = String(modelName || "");
     const m = name2.match(/(\d+(?:\.\d+)?)\s*B\b/i);
@@ -34066,7 +34962,7 @@
       modelUp = d.model === "up";
       if (d.version)
         $("setVersion").textContent = "v" + d.version;
-      $("modelInfo").textContent = "Model: " + d.modelName + " \xB7 status: " + d.model;
+      $("modelInfo").textContent = "Model: " + d.modelName + " \xB7 status: " + d.model + (d.llama === "missing" ? " \xB7 llama.cpp is not downloaded yet - the editor works, the AI waits (Settings)" : d.llama === "downloading" ? " \xB7 downloading llama.cpp\u2026" : d.llama === "error" ? " \xB7 llama.cpp download failed (Settings)" : "");
       const pill = $("modelPill");
       pill.textContent = modelUp ? shortModelLabel(d.modelName) : "model: down";
       pill.title = d.modelName || "";
@@ -34154,6 +35050,7 @@
   });
   function setDrawer(open, mode) {
     if (mode) drawerMode = mode;
+    if (open) closeOverlayPanels(null);
     document.body.classList.toggle("drawer-open", open);
     syncViewBar();
   }
@@ -34196,6 +35093,52 @@
   $("viewChat").onclick = () => setSheet(
     currentSheetStop() === "min" ? "mid" : "min"
   );
+  var OVERLAY_PANEL_IDS = [
+    "settingsPanel",
+    "findPanel",
+    "diffPanel",
+    "conflictPanel",
+    "toolsPanel",
+    "todoPanel",
+    "snipPanel",
+    "previewPanel",
+    "quickPanel",
+    "keysPanel",
+    "pluginPanel"
+  ];
+  function closeOverlayPanels(exceptId) {
+    if (window.innerWidth > 900) return;
+    for (const id2 of OVERLAY_PANEL_IDS) {
+      if (id2 === exceptId) continue;
+      const el = document.getElementById(id2);
+      if (el && !el.classList.contains("hidden"))
+        el.classList.add("hidden");
+    }
+  }
+  try {
+    const soloWasHidden = {};
+    const soloObs = new MutationObserver((muts) => {
+      for (const m of muts) {
+        const el = m.target;
+        const hidden = el.classList.contains("hidden");
+        const was = soloWasHidden[el.id];
+        soloWasHidden[el.id] = hidden;
+        if (was === true && !hidden)
+          closeOverlayPanels(el.id);
+      }
+    });
+    for (const id2 of OVERLAY_PANEL_IDS) {
+      const el = document.getElementById(id2);
+      if (el) {
+        soloWasHidden[id2] = el.classList.contains("hidden");
+        soloObs.observe(
+          el,
+          { attributes: true, attributeFilter: ["class"] }
+        );
+      }
+    }
+  } catch (e) {
+  }
   try {
     let stop = localStorage.getItem("ghostide-sheet");
     if (!stop) {
@@ -36008,6 +36951,8 @@
         if (sc) sc.textContent = "";
         const tl = $("tagList");
         if (tl) tl.textContent = "";
+        const msn = $("gitMergeState");
+        if (msn) msn.textContent = "";
         $("gitAiMsg").disabled = true;
         $("branchChip").classList.add("hidden");
         box.innerHTML = "";
@@ -36031,6 +36976,29 @@
       const scopeEl = $("gitScopeLine");
       if (scopeEl)
         scopeEl.textContent = d.scope_line ? "Last Scope: " + d.scope_line : "";
+      const msEl = $("gitMergeState");
+      if (msEl) {
+        const msNames = {
+          "merge": "Merge",
+          "rebase": "Rebase",
+          "cherry-pick": "Cherry-pick",
+          "revert": "Revert"
+        };
+        const nConf = (d.conflicts || []).length;
+        if (d.mergeState && nConf) {
+          msEl.textContent = "\u26A0 " + (msNames[d.mergeState] || "Operation") + " in progress: " + nConf + " conflicted file" + (nConf === 1 ? "" : "s") + " to resolve below.";
+        } else if (d.mergeState === "merge") {
+          msEl.textContent = "Merge in progress: all conflicts resolved, ready to commit.";
+        } else if (d.mergeState === "rebase") {
+          msEl.textContent = "Rebase in progress: all conflicts resolved. Next step: run git rebase --continue in a terminal.";
+        } else if (d.mergeState === "cherry-pick") {
+          msEl.textContent = "Cherry-pick in progress: all conflicts resolved, ready to commit (or git cherry-pick --continue in a terminal).";
+        } else if (d.mergeState === "revert") {
+          msEl.textContent = "Revert in progress: all conflicts resolved, ready to commit.";
+        } else {
+          msEl.textContent = "";
+        }
+      }
       renderWorktrees();
       renderBranches();
       renderStashes();
@@ -36050,12 +37018,21 @@
         row.className = "gitRow";
         const staged = c.index !== " " && c.index !== "?";
         const untracked = c.index === "?" && c.worktree === "?";
+        const conflicted = c.index === "U" || c.worktree === "U" || c.index === "A" && c.worktree === "A" || c.index === "D" && c.worktree === "D";
         const label = document.createElement("span");
         label.textContent = c.path + " ";
         const tag = document.createElement("em");
-        tag.textContent = untracked ? "untracked" : staged ? "staged" : "modified";
+        tag.textContent = conflicted ? "conflict" : untracked ? "untracked" : staged ? "staged" : "modified";
         label.appendChild(tag);
         row.appendChild(label);
+        if (conflicted) {
+          const rsb = document.createElement("button");
+          rsb.textContent = "Resolve";
+          rsb.onclick = () => openConflict(c.path);
+          row.appendChild(rsb);
+          box.appendChild(row);
+          continue;
+        }
         if (!staged) {
           const b = document.createElement("button");
           b.textContent = "Stage";
@@ -36155,8 +37132,260 @@
     $("diffTitle").textContent = "Diff: " + path;
     $("diffOut").textContent = d.error || d.diff || "(no diff - file may be untracked)";
     $("diffPanel").classList.remove("hidden");
+    renderHunks(path);
   }
   $("diffClose").onclick = () => $("diffPanel").classList.add("hidden");
+  async function renderHunks(path) {
+    const box = $("diffHunks");
+    if (!box) return;
+    box.textContent = "";
+    for (const area of ["worktree", "index"]) {
+      let d = null;
+      try {
+        const r = await fetch("/api/git/hunks?path=" + encodeURIComponent(path) + "&area=" + area);
+        d = await r.json();
+      } catch (e) {
+        d = null;
+      }
+      if (!d || d.error) continue;
+      if (d.binary) {
+        if (area === "worktree") {
+          const note = document.createElement("div");
+          note.className = "dim";
+          note.textContent = "Binary file: hunk staging does not apply. Use the file-level Stage button in the Git panel.";
+          box.appendChild(note);
+        }
+        continue;
+      }
+      if (!d.hunks.length) continue;
+      const head = document.createElement("div");
+      head.className = "dim";
+      head.textContent = area === "worktree" ? "Unstaged hunks" : "Staged hunks";
+      box.appendChild(head);
+      for (const h of d.hunks) {
+        const block = document.createElement("div");
+        block.className = "hunkBlock";
+        const hrow = document.createElement("div");
+        hrow.className = "hunkHead";
+        const hlab = document.createElement("span");
+        hlab.textContent = h.header;
+        hrow.appendChild(hlab);
+        if (area === "worktree") {
+          const sb = document.createElement("button");
+          sb.textContent = "Stage hunk";
+          sb.onclick = () => applyHunks(path, d, [h.index], "stage");
+          hrow.appendChild(sb);
+          const db = document.createElement("button");
+          db.textContent = "Discard hunk";
+          db.onclick = () => {
+            if (!confirm("Discard these changes? This cannot be undone from here")) return;
+            applyHunks(path, d, [h.index], "discard");
+          };
+          hrow.appendChild(db);
+        } else {
+          const ub = document.createElement("button");
+          ub.textContent = "Unstage hunk";
+          ub.onclick = () => applyHunks(path, d, [h.index], "unstage");
+          hrow.appendChild(ub);
+        }
+        block.appendChild(hrow);
+        const pre = document.createElement("pre");
+        pre.textContent = h.text;
+        block.appendChild(pre);
+        box.appendChild(block);
+      }
+    }
+  }
+  async function applyHunks(path, d, indices, action) {
+    const selected = {};
+    for (const i2 of indices) {
+      const h = d.hunks.find((x) => x.index === i2);
+      if (h) selected[i2] = h.sha;
+    }
+    const r = await postJson("/api/git/hunks/apply", {
+      path,
+      area: d.area,
+      action,
+      hunks: indices,
+      expect: { headers: d.headers, selected }
+    });
+    if (r.error) alert(r.error);
+    showDiff(path);
+    refreshGit();
+    loadFiles();
+  }
+  var conflictPath = null;
+  function splitConflictBlocks(text) {
+    const lines = text.split("\n");
+    const segs = [];
+    let buf = [];
+    let i2 = 0;
+    const flush = () => {
+      if (buf.length) {
+        segs.push({ kind: "text", text: buf.join("\n") });
+        buf = [];
+      }
+    };
+    while (i2 < lines.length) {
+      if (lines[i2].startsWith("<<<<<<<")) {
+        const raw = [lines[i2]];
+        const ours = [];
+        const theirs = [];
+        let side = 0;
+        i2++;
+        let closed = false;
+        while (i2 < lines.length) {
+          const ln = lines[i2];
+          raw.push(ln);
+          i2++;
+          if (ln.startsWith(">>>>>>>")) {
+            closed = true;
+            break;
+          }
+          if (ln.startsWith("|||||||") && side === 0) {
+            side = 1;
+            continue;
+          }
+          if (ln.startsWith("=======") && side < 2) {
+            side = 2;
+            continue;
+          }
+          if (side === 0) ours.push(ln);
+          else if (side === 2) theirs.push(ln);
+        }
+        if (!closed) {
+          buf.push.apply(buf, raw);
+          break;
+        }
+        flush();
+        segs.push({
+          kind: "conflict",
+          ours: ours.join("\n"),
+          theirs: theirs.join("\n"),
+          raw: raw.join("\n")
+        });
+      } else {
+        buf.push(lines[i2]);
+        i2++;
+      }
+    }
+    flush();
+    return segs;
+  }
+  function countConflictBlocks(text) {
+    return splitConflictBlocks(text).filter((s) => s.kind === "conflict").length;
+  }
+  function renderConflictBlocks() {
+    const box = $("conflictBlocks");
+    if (!box) return;
+    box.textContent = "";
+    const segs = splitConflictBlocks(
+      $("conflictResult").value
+    );
+    const blocks = segs.map((s, idx) => ({ s, idx })).filter((x) => x.s.kind === "conflict");
+    blocks.forEach((x, n) => {
+      const row = document.createElement("div");
+      row.className = "conflictRow";
+      const lab = document.createElement("span");
+      lab.textContent = "Conflict " + (n + 1) + " of " + blocks.length + ":";
+      row.appendChild(lab);
+      const choices = [
+        ["Use ours", "ours"],
+        ["Use theirs", "theirs"],
+        ["Use both (ours first)", "ours-theirs"],
+        ["Use both (theirs first)", "theirs-ours"]
+      ];
+      for (const pair2 of choices) {
+        const b = document.createElement("button");
+        b.textContent = pair2[0];
+        b.onclick = () => applyConflictChoice(x.idx, pair2[1]);
+        row.appendChild(b);
+      }
+      box.appendChild(row);
+    });
+    updateConflictCount();
+  }
+  function applyConflictChoice(segIdx, choice) {
+    const ta = $("conflictResult");
+    const segs = splitConflictBlocks(ta.value);
+    const seg = segs[segIdx];
+    if (!seg || seg.kind !== "conflict") {
+      $("conflictMsg").textContent = "That conflict block is no longer in the result; the list has been refreshed.";
+      renderConflictBlocks();
+      return;
+    }
+    let repl;
+    if (choice === "ours") repl = seg.ours;
+    else if (choice === "theirs") repl = seg.theirs;
+    else {
+      const parts = choice === "ours-theirs" ? [seg.ours, seg.theirs] : [seg.theirs, seg.ours];
+      repl = parts.filter((s) => s !== "").join("\n");
+    }
+    segs[segIdx] = { kind: "text", text: repl };
+    ta.value = segs.map((s) => s.kind === "text" ? s.text : s.raw).join("\n");
+    renderConflictBlocks();
+  }
+  function updateConflictCount() {
+    const ta = $("conflictResult");
+    const el = $("conflictCount");
+    if (!ta || !el) return;
+    const n = countConflictBlocks(ta.value);
+    el.textContent = "Conflicts remaining: " + n;
+    const msg = $("conflictMsg");
+    if (msg) {
+      msg.textContent = n ? "Saving is blocked while conflict markers remain, unless you override on the save prompt (a hand-resolved file can legitimately contain marker-like text)." : "";
+    }
+  }
+  async function openConflict(path) {
+    let d = null;
+    try {
+      const r = await fetch("/api/git/conflict?path=" + encodeURIComponent(path));
+      d = await r.json();
+    } catch (e) {
+      d = null;
+    }
+    if (!d || d.error) {
+      alert(d && d.error || "Could not load the conflict.");
+      return;
+    }
+    conflictPath = path;
+    $("conflictTitle").textContent = "Resolve conflict: " + path;
+    $("conflictBase").textContent = d.base == null ? "(no base version in this conflict)" : d.base;
+    $("conflictOurs").textContent = d.ours == null ? "(no version on the current branch)" : d.ours;
+    $("conflictTheirs").textContent = d.theirs == null ? "(no incoming version)" : d.theirs;
+    $("conflictResult").value = d.working || "";
+    $("conflictPanel").classList.remove("hidden");
+    renderConflictBlocks();
+  }
+  $("conflictClose").onclick = () => $("conflictPanel").classList.add("hidden");
+  $("conflictResult").addEventListener("input", () => {
+    renderConflictBlocks();
+  });
+  $("conflictSave").onclick = async () => {
+    if (!conflictPath) return;
+    const text = $("conflictResult").value;
+    const n = countConflictBlocks(text);
+    if (n > 0) {
+      if (!confirm(n + " conflict block" + (n === 1 ? " is" : "s are") + " still in the result. Save anyway? Only do this if the file is meant to contain marker-like text.")) {
+        $("conflictMsg").textContent = "Not saved: " + n + " conflict block" + (n === 1 ? "" : "s") + " remain. Resolve them above or edit the result by hand.";
+        return;
+      }
+    }
+    const d = await postJson(
+      "/api/git/conflict/resolve",
+      { path: conflictPath, content: text }
+    );
+    if (d.error) {
+      alert(d.error);
+      return;
+    }
+    $("conflictPanel").classList.add("hidden");
+    if (conflictPath === currentFile)
+      reloadCurrentFromDisk();
+    conflictPath = null;
+    refreshGit();
+    loadFiles();
+  };
   function ghToken() {
     const el = $("ghToken");
     return el ? el.value.trim() : "";
@@ -36372,6 +37601,7 @@
     renderTabs();
     refreshWsLabel();
     loadFiles();
+    refreshTrustUI(true);
   }
   $("findBtn").onclick = () => $("findPanel").classList.toggle("hidden");
   $("findClose").onclick = () => $("findPanel").classList.add("hidden");
@@ -36569,6 +37799,138 @@
     n.textContent = "GhostIndex FTS5: " + d.shown + " of " + d.total_matches + " file(s) shown, excerpts token-budgeted" + (d.capped ? " (capped by " + (d.capped_by || []).join(", ") + ")" : "") + ". Counts are the tool's estimates.";
     box.appendChild(n);
   };
+  var embedPollTimer = null;
+  function embedPollStop() {
+    if (embedPollTimer) {
+      clearInterval(embedPollTimer);
+      embedPollTimer = null;
+    }
+  }
+  function embedPollStart() {
+    if (!embedPollTimer)
+      embedPollTimer = setInterval(refreshFindNeural, 2e3);
+  }
+  async function refreshFindNeural() {
+    const q = $("findQuery").value;
+    const box = $("findResults");
+    let st;
+    try {
+      const r = await fetch("/api/embed/status");
+      st = await r.json();
+    } catch (e) {
+      embedPollStop();
+      box.textContent = "Neural search is unavailable: " + e;
+      return;
+    }
+    const dl = st.model.download || {};
+    if (!st.model.present) {
+      box.textContent = "";
+      const n2 = document.createElement("div");
+      if (dl.state === "downloading") {
+        embedPollStart();
+        n2.textContent = "Downloading the embedding model\u2026 " + Math.round(100 * (dl.done || 0) / (dl.total || 1)) + "% of about 139 MB. Neural search starts when it lands.";
+        box.appendChild(n2);
+        return;
+      }
+      if (dl.state === "verifying") {
+        embedPollStart();
+        n2.textContent = "Verifying the embedding model checksum\u2026";
+        box.appendChild(n2);
+        return;
+      }
+      embedPollStop();
+      n2.textContent = "Neural search needs the embedding model (nomic-embed-text-v1.5, about 139 MB). It runs fully on this machine; nothing is sent anywhere." + (dl.state === "error" ? " Last download error: " + dl.error : "");
+      box.appendChild(n2);
+      const b2 = document.createElement("button");
+      b2.textContent = "Download embedding model";
+      b2.onclick = async () => {
+        const d2 = await postJson("/api/embed/download", {});
+        if (d2.error) {
+          box.textContent = d2.error;
+          return;
+        }
+        refreshFindNeural();
+      };
+      box.appendChild(b2);
+      return;
+    }
+    if (st.build.state === "building") {
+      embedPollStart();
+      box.textContent = "Building the neural index\u2026 " + (st.build.done || 0) + " of " + (st.build.total || 0) + " changed file(s) embedded.";
+      return;
+    }
+    embedPollStop();
+    if (st.build.state === "error") {
+      box.textContent = "The last index build failed: " + st.build.error;
+      return;
+    }
+    if (!st.index.chunks) {
+      box.textContent = "";
+      const n2 = document.createElement("div");
+      n2.textContent = "The embedding model is ready, but this workspace has no neural index yet. Building it embeds every code chunk locally; only changed files are re-embedded on later builds.";
+      box.appendChild(n2);
+      const b2 = document.createElement("button");
+      b2.textContent = "Build index";
+      b2.onclick = async () => {
+        const d2 = await postJson("/api/embed/build", {});
+        if (d2.error) {
+          box.textContent = d2.error;
+          return;
+        }
+        refreshFindNeural();
+      };
+      box.appendChild(b2);
+      return;
+    }
+    if (!q.trim()) {
+      box.textContent = "Type a plain-English description of the code, then tap Neural.";
+      return;
+    }
+    box.textContent = "asking the embedding model\u2026";
+    const d = await postJson(
+      "/api/embed/search",
+      { query: q }
+    );
+    if (d.error) {
+      box.textContent = d.error;
+      return;
+    }
+    if (!d.available) {
+      box.textContent = "Neural search is not ready: " + (d.notice || "unknown reason");
+      return;
+    }
+    box.textContent = "";
+    if (!d.results.length) {
+      box.textContent = "No chunks matched that meaning.";
+      return;
+    }
+    for (const r of d.results) {
+      const row = document.createElement("div");
+      row.className = "findRow";
+      row.textContent = "\u2726 " + r.path + ":" + r.start_line + "  (" + Math.round(r.score * 100) + "%)" + (r.name ? "  " + r.name : "") + "  " + r.excerpt;
+      row.onclick = async () => {
+        await openFile(r.path);
+        jumpToLine(r.start_line);
+      };
+      box.appendChild(row);
+    }
+    const n = document.createElement("div");
+    n.className = "dim";
+    n.textContent = "Neural embeddings (local model): " + st.index.chunks + " chunks over " + st.index.files + " files; scores are cosine similarity.";
+    box.appendChild(n);
+    const b = document.createElement("button");
+    b.textContent = "Refresh index";
+    b.onclick = async () => {
+      const d2 = await postJson("/api/embed/build", {});
+      if (d2.error) {
+        box.textContent = d2.error;
+        return;
+      }
+      refreshFindNeural();
+    };
+    box.appendChild(b);
+  }
+  $("findNeural").onclick = refreshFindNeural;
   $("findReplace").onclick = async () => {
     const q = $("findQuery").value;
     if (!q) return;
@@ -37412,6 +38774,26 @@
     diagChipBtn.onclick = () => {
       if (diagProblem) jumpToLine(diagProblem.line);
     };
+  $("setLsp").checked = settings.lsp !== false;
+  $("setLsp").onchange = (e) => {
+    settings.lsp = e.target.checked;
+    saveSettings();
+    if (!settings.lsp) {
+      lspDiagsByPath = {};
+      applyDiagnostics();
+      const chip = $("lspChip");
+      if (chip) chip.classList.add("hidden");
+    } else {
+      if (currentFile)
+        lspOpenFile(currentFile, view.state.doc.toString());
+      lspRefreshStatus();
+    }
+  };
+  var lspChipBtn = $("lspChip");
+  if (lspChipBtn) lspChipBtn.onclick = () => {
+    lspChipAction();
+  };
+  lspRefreshStatus();
   $("setFold").checked = settings.fold !== false;
   $("setFold").onchange = (e) => {
     settings.fold = e.target.checked;
@@ -37473,6 +38855,13 @@
     }
     const box = $("todoResults");
     box.textContent = "";
+    const mcpStatus = {};
+    try {
+      const st = await (await fetch("/api/mcp/status")).json();
+      for (const r of st && st.servers || [])
+        mcpStatus[r.name] = r;
+    } catch (e) {
+    }
     const head = document.createElement("div");
     head.className = "dim";
     head.textContent = sd.error ? sd.error : !sd.config ? "No MCP config found. Add a .mcp.json to this workspace (standard mcpServers format) and MCP servers will appear here - and in the agent's briefing." : "Config: " + sd.config + " - " + (sd.servers || []).length + " server(s). Pick one to see its tools.";
@@ -37481,8 +38870,58 @@
       const row = document.createElement("div");
       row.className = "todorow";
       const label = document.createElement("span");
-      label.textContent = s.name + " - " + s.transport + " - " + s.target;
+      label.textContent = s.name + " - " + s.transport + " - " + s.target + " [" + (s.transport === "http" ? "Remote server" : "Runs commands on this computer") + "]";
       row.appendChild(label);
+      const stRow = mcpStatus[s.name];
+      if (stRow) {
+        const stSpan = document.createElement("span");
+        stSpan.className = "dim";
+        stSpan.textContent = "Status: " + stRow.status + (stRow.tools != null ? ", " + stRow.tools + " tool(s)" : "") + (stRow.error ? " - " + stRow.error : "");
+        row.appendChild(stSpan);
+        const tgl = document.createElement("button");
+        tgl.className = "ghostbtn";
+        tgl.textContent = stRow.status === "disabled" ? "Enable server" : "Disable server";
+        tgl.onclick = async () => {
+          tgl.disabled = true;
+          try {
+            await postJson(
+              "/api/mcp/policy",
+              {
+                server: s.name,
+                server_enabled: stRow.status === "disabled"
+              }
+            );
+            _mcpPolicyAt = 0;
+          } catch (e) {
+          }
+          openMcpPanel();
+        };
+        row.appendChild(tgl);
+        if (stRow.status === "needs-auth") {
+          const cn = document.createElement("button");
+          cn.className = "ghostbtn";
+          cn.textContent = "Connect (OAuth)";
+          cn.onclick = async () => {
+            cn.disabled = true;
+            cn.textContent = "Opening sign-in\u2026";
+            try {
+              const d = await postJson(
+                "/api/mcp/oauth/start",
+                { server: s.name }
+              );
+              if (d.error) {
+                cn.textContent = d.error;
+                return;
+              }
+              window.open(d.auth_url, "_blank");
+              cn.textContent = "Finish in the browser, then reopen this panel";
+            } catch (e) {
+              cn.textContent = "Connect failed";
+            }
+          };
+          row.appendChild(cn);
+        }
+      }
       const b = document.createElement("button");
       b.className = "ghostbtn";
       b.textContent = "Tools";
@@ -37534,9 +38973,65 @@
             const tl = document.createElement("span");
             tl.textContent = t2.name + (t2.description ? " - " + String(t2.description).slice(0, 120) : "");
             tr.appendChild(tl);
+            const ann = t2.annotations || {};
+            const hints = [];
+            if (ann.readOnlyHint) hints.push("read-only");
+            if (ann.destructiveHint)
+              hints.push("destructive");
+            if (ann.openWorldHint) hints.push("open-world");
+            if (hints.length) {
+              const hs = document.createElement("span");
+              hs.className = "dim";
+              hs.textContent = "(" + hints.join(", ") + ")";
+              tr.appendChild(hs);
+            }
+            const en = document.createElement("input");
+            en.type = "checkbox";
+            en.checked = t2.enabled !== false;
+            en.title = "Offer this tool to the agent";
+            en.onchange = async () => {
+              try {
+                await postJson(
+                  "/api/mcp/policy",
+                  {
+                    server: s.name,
+                    tool: t2.name,
+                    enabled: en.checked
+                  }
+                );
+                _mcpPolicyAt = 0;
+              } catch (e) {
+              }
+              openMcpPanel();
+            };
+            tr.appendChild(en);
+            const ap = document.createElement("select");
+            for (const mode of ["ask", "allow"]) {
+              const op = document.createElement("option");
+              op.value = mode;
+              op.textContent = mode === "ask" ? "always ask" : "allow in this workspace";
+              ap.appendChild(op);
+            }
+            ap.value = t2.approval === "allow" ? "allow" : "ask";
+            ap.onchange = async () => {
+              try {
+                await postJson(
+                  "/api/mcp/policy",
+                  {
+                    server: s.name,
+                    tool: t2.name,
+                    approval: ap.value
+                  }
+                );
+                _mcpPolicyAt = 0;
+              } catch (e) {
+              }
+            };
+            tr.appendChild(ap);
             const cb = document.createElement("button");
             cb.className = "ghostbtn";
             cb.textContent = "Call";
+            if (t2.enabled === false) cb.disabled = true;
             cb.onclick = async () => {
               const raw = prompt(t2.name + " - arguments as a JSON object:", "{}");
               if (raw === null) return;
@@ -37729,6 +39224,7 @@
       row.appendChild(pb);
       box.appendChild(row);
     }
+    renderMcpManage(box);
   }
   var toolMcpBtn = $("toolMcp");
   if (toolMcpBtn)
@@ -37755,6 +39251,239 @@
   var gitGhostScopeBtn = $("gitGhostScope");
   if (gitGhostScopeBtn)
     gitGhostScopeBtn.onclick = () => gitProofRun("/api/git/scope", gitGhostScopeBtn, "\u2026");
+  var _mcpPolicyCache = null;
+  var _mcpPolicyAt = 0;
+  async function mcpRunPolicy() {
+    if (_mcpPolicyCache && Date.now() - _mcpPolicyAt < 3e4)
+      return _mcpPolicyCache;
+    try {
+      const d = await (await fetch("/api/mcp/policy")).json();
+      _mcpPolicyCache = d && d.servers || {};
+    } catch (e) {
+      _mcpPolicyCache = {};
+    }
+    _mcpPolicyAt = Date.now();
+    return _mcpPolicyCache;
+  }
+  async function mcpRunRefusal(act) {
+    const pol = await mcpRunPolicy();
+    const srv = pol[act.server];
+    if (!srv) return null;
+    if (srv.enabled === false)
+      return "the MCP server '" + act.server + "' is disabled in this workspace.";
+    const tool = (srv.tools || {})[act.tool];
+    if (tool && tool.enabled === false)
+      return "the MCP tool '" + act.server + "." + act.tool + "' is disabled in this workspace.";
+    return null;
+  }
+  async function mcpRunAllowed(act) {
+    const pol = await mcpRunPolicy();
+    const srv = pol[act.server];
+    const tool = srv && (srv.tools || {})[act.tool];
+    return !!(tool && tool.approval === "allow");
+  }
+  function mcpManageRow(box) {
+    const row = document.createElement("div");
+    row.className = "todorow";
+    box.appendChild(row);
+    return row;
+  }
+  function mcpManageNote(box, text) {
+    const d = document.createElement("div");
+    d.className = "dim";
+    d.textContent = text;
+    box.appendChild(d);
+    return d;
+  }
+  async function renderMcpManage(box) {
+    const head = document.createElement("div");
+    head.className = "dim";
+    head.textContent = "Add and manage servers. Servers you add here live in your user config (app data), not in the workspace. Header values (tokens) are stored separately in app data and are never shown back here.";
+    box.appendChild(head);
+    let cfg = null;
+    try {
+      cfg = await (await fetch("/api/mcp/config")).json();
+    } catch (e) {
+    }
+    if (cfg && cfg.active_config && !cfg.active_is_user)
+      mcpManageNote(box, "Note: this workspace has its own MCP config (" + cfg.active_config + "), which takes precedence over your user config.");
+    try {
+      const cd = await (await fetch("/api/mcp/catalog")).json();
+      for (const item of cd && cd.catalog || []) {
+        const row = mcpManageRow(box);
+        const lab = document.createElement("span");
+        lab.textContent = item.name + " - " + item.blurb + " [" + item.label + "; needs " + item.runtime + "]";
+        row.appendChild(lab);
+        const add2 = document.createElement("button");
+        add2.className = "ghostbtn";
+        add2.textContent = "Add";
+        add2.onclick = async () => {
+          add2.disabled = true;
+          try {
+            const d = await postJson(
+              "/api/mcp/config/server",
+              { name: item.id, entry: item.entry }
+            );
+            add2.textContent = d.error || "Added";
+            if (!d.error) openMcpPanel();
+          } catch (e) {
+            add2.textContent = "Add failed";
+          }
+        };
+        row.appendChild(add2);
+      }
+    } catch (e) {
+    }
+    if (cfg) {
+      for (const s of cfg.servers || []) {
+        const row = mcpManageRow(box);
+        const lab = document.createElement("span");
+        lab.textContent = s.name + " (" + s.transport + ") [" + s.label + "]" + (s.header_names && s.header_names.length ? " headers: " + s.header_names.join(", ") : "") + (s.oauth ? " OAuth" : "");
+        row.appendChild(lab);
+        const del = document.createElement("button");
+        del.className = "ghostbtn";
+        del.textContent = "Remove";
+        del.onclick = async () => {
+          del.disabled = true;
+          try {
+            await postJson(
+              "/api/mcp/config/delete",
+              { name: s.name }
+            );
+          } catch (e) {
+          }
+          openMcpPanel();
+        };
+        row.appendChild(del);
+      }
+    }
+    const impNote = mcpManageNote(
+      box,
+      "Import: paste an mcpServers config (Claude / Cursor format). Invalid entries are reported, never silently dropped."
+    );
+    const ta = document.createElement("textarea");
+    ta.rows = 4;
+    ta.cols = 60;
+    ta.placeholder = '{"mcpServers": {...}}';
+    box.appendChild(ta);
+    const impRow = mcpManageRow(box);
+    const impBtn = document.createElement("button");
+    impBtn.className = "ghostbtn";
+    impBtn.textContent = "Import";
+    const impOut = document.createElement("span");
+    impBtn.onclick = async () => {
+      impBtn.disabled = true;
+      try {
+        const d = await postJson(
+          "/api/mcp/config/import",
+          { text: ta.value }
+        );
+        if (d.error) {
+          impOut.textContent = d.error;
+        } else {
+          const errs = Object.entries(d.errors || {}).map(([k, v]) => k + ": " + v).join("; ");
+          impOut.textContent = "Imported: " + ((d.imported || []).join(", ") || "none") + (errs ? ". Problems: " + errs : "");
+          if ((d.imported || []).length) openMcpPanel();
+        }
+      } catch (e) {
+        impOut.textContent = "Import failed";
+      }
+      impBtn.disabled = false;
+    };
+    impRow.appendChild(impBtn);
+    impRow.appendChild(impOut);
+    mcpManageNote(box, "Add your own server:");
+    const form = document.createElement("div");
+    box.appendChild(form);
+    const mk = (label, ph) => {
+      const row = mcpManageRow(form);
+      const l = document.createElement("span");
+      l.textContent = label;
+      row.appendChild(l);
+      const inp = document.createElement("input");
+      inp.type = "text";
+      if (ph) inp.placeholder = ph;
+      row.appendChild(inp);
+      return inp;
+    };
+    const fName = mk("Name", "my-server");
+    const fKind = document.createElement("select");
+    for (const [v, t2] of [
+      ["command", "Command (stdio)"],
+      ["url", "URL (http)"]
+    ]) {
+      const op = document.createElement("option");
+      op.value = v;
+      op.textContent = t2;
+      fKind.appendChild(op);
+    }
+    const kindRow = mcpManageRow(form);
+    const kindLab = document.createElement("span");
+    kindLab.textContent = "Type";
+    kindRow.appendChild(kindLab);
+    kindRow.appendChild(fKind);
+    const kindNote = mcpManageNote(
+      form,
+      "A command server runs commands on this computer. A URL server is a remote server."
+    );
+    const fCmd = mk("Command", "npx");
+    const fArgs = mk("Args (JSON list)", '["-y", "pkg"]');
+    const fUrl = mk("URL", "https://example.com/mcp");
+    const fHdrName = mk("Header name", "Authorization");
+    const fHdrVal = mk("Header value (token)", "Bearer ...");
+    fHdrVal.type = "password";
+    const oauthRow = mcpManageRow(form);
+    const fOauth = document.createElement("input");
+    fOauth.type = "checkbox";
+    oauthRow.appendChild(fOauth);
+    const oauthLab = document.createElement("span");
+    oauthLab.textContent = "Use OAuth sign-in (URL servers; connect from the server list after adding)";
+    oauthRow.appendChild(oauthLab);
+    const addRow = mcpManageRow(form);
+    const addBtn = document.createElement("button");
+    addBtn.className = "ghostbtn";
+    addBtn.textContent = "Add server";
+    const addOut = document.createElement("span");
+    addBtn.onclick = async () => {
+      const entry = {};
+      if (fKind.value === "url") {
+        entry.url = fUrl.value.trim();
+        if (fOauth.checked) entry.oauth = true;
+      } else {
+        entry.command = fCmd.value.trim();
+        const raw = fArgs.value.trim();
+        if (raw) {
+          try {
+            entry.args = JSON.parse(raw);
+          } catch (e) {
+            addOut.textContent = "Args must be a JSON list.";
+            return;
+          }
+        }
+      }
+      if (fHdrVal.value)
+        entry.headers = {
+          [fHdrName.value.trim() || "Authorization"]: fHdrVal.value
+        };
+      addBtn.disabled = true;
+      try {
+        const d = await postJson(
+          "/api/mcp/config/server",
+          { name: fName.value.trim(), entry }
+        );
+        if (d.error) addOut.textContent = d.error;
+        else {
+          addOut.textContent = "Added";
+          openMcpPanel();
+        }
+      } catch (e) {
+        addOut.textContent = "Add failed";
+      }
+      addBtn.disabled = false;
+    };
+    addRow.appendChild(addBtn);
+    addRow.appendChild(addOut);
+  }
   async function openApprovePanel() {
     hideTools();
     $("todoTitle").textContent = "Approve queue";
@@ -39380,6 +41109,7 @@
     findGo: { en: "Find", es: "Buscar" },
     findSemantic: { en: "\u{1F9E0} Meaning", es: "\u{1F9E0} Significado" },
     findIndexed: { en: "\u{1F50E} Indexed", es: "\u{1F50E} Indexado" },
+    findNeural: { en: "\u2726 Neural", es: "\u2726 Neuronal" },
     findReplace: { en: "Replace all", es: "Reemplazar todo" },
     findClose: { en: "Close", es: "Cerrar" },
     settingsClose: { en: "Close", es: "Cerrar" },
@@ -43089,6 +44819,7 @@
     "replying with exactly ONE action per message:",
     "READ <path> - ask for a file's current content",
     "SEARCH <query> - search the whole workspace for text",
+    "SEMANTIC <query> - search code by meaning with the local neural embedding index (the result says when the lexical meaning search answered instead)",
     "LIST [path] - list workspace files (optionally under a path)",
     "WRITE <path> - on the next line a fenced code block with",
     "  the file's complete new content (whole file, no fragments)",
@@ -43123,7 +44854,7 @@
     "DONE <one-line summary> - the task is complete",
     "ASK <question> - you need the user to decide something",
     "You may BATCH several read-only actions in one reply, one",
-    "per line: READ, SEARCH, LIST, REVERSE, ECO, GIT, TODO,",
+    "per line: READ, SEARCH, SEMANTIC, LIST, REVERSE, ECO, GIT, TODO,",
     "STEP_DONE. Never batch WRITE, EDIT, RUN or DELETE.",
     "Rules: never invent file contents - READ a file before",
     "rewriting it. Keep every WRITE and EDIT syntactically valid.",
@@ -43138,12 +44869,13 @@
     "action per message:",
     "READ <path> - ask for a file's current content",
     "SEARCH <query> - search the whole workspace for text",
+    "SEMANTIC <query> - search code by meaning with the local neural embedding index (the result says when the lexical meaning search answered instead)",
     "LIST [path] - list workspace files",
     "REVERSE <path> - inspect a file or binary with GhostRE",
     "ECO <tool> - run an ecosystem tool (ghostindex, ghostdeps)",
     "GIT status / GIT diff / GIT log / GIT branches / GIT stash / GIT tags - repository state",
     "You may BATCH several read-only actions in one reply, one",
-    "per line: READ, SEARCH, LIST, REVERSE, ECO, GIT, TODO.",
+    "per line: READ, SEARCH, SEMANTIC, LIST, REVERSE, ECO, GIT, TODO.",
     "TODO <text> - add one step of the plan",
     "DONE <one-line summary> - on the following lines, a fenced",
     "  block with the full written plan in markdown",
@@ -43151,6 +44883,17 @@
     "Add each plan step as a TODO as you work it out, then finish",
     "with DONE and the written plan. You have at most " + AGENT_PLAN_MAX_STEPS + " actions."
   ].join("\n");
+  async function semanticForAgent(query) {
+    const d = await postJson("/api/embed/search", { query });
+    if (!d.error && d.available && d.engine === "neural") {
+      const rs2 = (d.results || []).slice(0, 12);
+      return "Semantic results for " + query + " (answered by the neural embedding index):\n" + (rs2.length ? rs2.map((x) => x.path + ":" + x.start_line + " " + (x.name || "") + " " + x.excerpt).join("\n") : "(no matches)");
+    }
+    const note = d.error || d.notice || "the neural index is unavailable";
+    const l = await postJson("/api/semsearch", { query });
+    const rs = (l.results || []).slice(0, 12);
+    return "Semantic results for " + query + " (neural index unavailable: " + note + "; answered by lexical meaning search):\n" + (rs.length ? rs.map((x) => x.path + ":" + x.line + " " + x.name).join("\n") : "(no matches)");
+  }
   function parseAgentAction(reply) {
     const text = reply || "";
     let m = text.match(/^\s*READ\s+(\S+)\s*$/m);
@@ -43184,6 +44927,8 @@
       };
       return { type: "editbad", path: m[1] };
     }
+    m = text.match(/^\s*SEMANTIC\s+(.+)$/m);
+    if (m) return { type: "semantic", query: m[1].trim() };
     m = text.match(/^\s*SEARCH\s+(.+)$/m);
     if (m) return { type: "search", query: m[1].trim() };
     m = text.match(/^\s*LIST(?:\s+(\S+))?\s*$/m);
@@ -43324,6 +45069,197 @@
   }
   window.__ghostParseAgent2 = parseAgent2Action;
   window.__ghostApplyEdit = applyEditPatch;
+  var RUN_CKPT_MAX_CHARS = 512e3;
+  var RUN_RECORD_MAX_STEPS = 400;
+  function agentRunStamp(date) {
+    const d = date || /* @__PURE__ */ new Date();
+    const p = (x) => String(x).padStart(2, "0");
+    return d.getFullYear() + p(d.getMonth() + 1) + p(d.getDate()) + "-" + p(d.getHours()) + p(d.getMinutes()) + p(d.getSeconds());
+  }
+  function makeAgentRunId(date, rand) {
+    return "run-" + agentRunStamp(date) + "-" + String(rand || "0000").replace(/[^a-z0-9]/gi, "").slice(0, 6);
+  }
+  function runCheckpointPath(runId) {
+    return ".ghostide/checkpoints/ckpt-" + runId + ".json";
+  }
+  function planFilePath(date) {
+    return ".ghostide/plans/plan-" + agentRunStamp(date) + ".md";
+  }
+  function buildPlanFile(task, planText, todos, date) {
+    const steps = normalizeAgentTodos(todos);
+    const lines = [
+      "# GhostIDE plan",
+      "",
+      "Task: " + String(task || "").slice(0, 300),
+      "Created: " + (date || /* @__PURE__ */ new Date()).toISOString(),
+      "",
+      "Steps:"
+    ];
+    if (steps.length)
+      steps.forEach((t2, i2) => lines.push(i2 + 1 + ". " + t2.text));
+    else lines.push("(no steps recorded)");
+    lines.push(
+      "",
+      "---",
+      "",
+      String(planText || "").trim(),
+      ""
+    );
+    return lines.join("\n");
+  }
+  function planBodyFromFile(content2) {
+    const text = String(content2 || "");
+    const lines = text.split("\n");
+    for (let i2 = 0; i2 < lines.length; i2++)
+      if (lines[i2].trim() === "---")
+        return lines.slice(i2 + 1).join("\n").trim();
+    return text.trim();
+  }
+  function splitRunOriginals(originals, deletedPaths) {
+    const del = new Set(deletedPaths || []);
+    const files = {}, deleted = {};
+    for (const [p, c] of Object.entries(originals || {})) {
+      if (del.has(p)) deleted[p] = c;
+      else files[p] = c;
+    }
+    return { files, deleted };
+  }
+  function runChangeKind(path, originals, deletedPaths) {
+    if ((deletedPaths || []).includes(path)) return "deleted";
+    if (originals && path in originals && originals[path] == null) return "created";
+    return "modified";
+  }
+  function parseUnifiedDiff(text) {
+    const hunks = [];
+    let cur2 = null, gotOld = 0, gotNew = 0;
+    for (const line of String(text || "").split("\n")) {
+      const m = line.match(
+        /^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@/
+      );
+      if (m) {
+        cur2 = {
+          oldStart: +m[1],
+          oldCount: m[2] === void 0 ? 1 : +m[2],
+          newStart: +m[3],
+          newCount: m[4] === void 0 ? 1 : +m[4],
+          lines: []
+        };
+        hunks.push(cur2);
+        gotOld = 0;
+        gotNew = 0;
+        continue;
+      }
+      if (!cur2) continue;
+      if (gotOld >= cur2.oldCount && gotNew >= cur2.newCount) {
+        cur2 = null;
+        continue;
+      }
+      if (line.startsWith("\\")) continue;
+      const t2 = line.charAt(0);
+      if (t2 === " " || t2 === "+" || t2 === "-") {
+        cur2.lines.push({ t: t2, text: line.slice(1) });
+        if (t2 !== "+") gotOld++;
+        if (t2 !== "-") gotNew++;
+      } else if (line === "") {
+        cur2.lines.push({ t: " ", text: "" });
+        gotOld++;
+        gotNew++;
+      }
+    }
+    return hunks;
+  }
+  function reverseUnifiedHunk(content2, hunk) {
+    const lines = String(content2 == null ? "" : content2).split("\n");
+    const newSide = [], oldSide = [];
+    for (const l of hunk.lines) {
+      if (l.t === " " || l.t === "+") newSide.push(l.text);
+      if (l.t === " " || l.t === "-") oldSide.push(l.text);
+    }
+    if (!newSide.length && !oldSide.length)
+      return { ok: false, error: "empty hunk" };
+    const start0 = Math.max(0, (hunk.newStart || 1) - 1);
+    const matches = (at2) => {
+      if (at2 < 0 || at2 + newSide.length > lines.length)
+        return false;
+      for (let i2 = 0; i2 < newSide.length; i2++)
+        if (lines[at2 + i2] !== newSide[i2]) return false;
+      return true;
+    };
+    let at = -1;
+    if (matches(start0)) at = start0;
+    else {
+      for (let d = 1; d <= 80 && at < 0; d++) {
+        if (matches(start0 - d)) at = start0 - d;
+        else if (matches(start0 + d)) at = start0 + d;
+      }
+    }
+    if (at < 0)
+      return {
+        ok: false,
+        error: "this hunk no longer matches the file (it changed since the run) - undo the whole file instead"
+      };
+    const out = lines.slice(0, at).concat(
+      oldSide,
+      lines.slice(at + newSide.length)
+    );
+    return { ok: true, content: out.join("\n") };
+  }
+  function buildRunRecord(f) {
+    f = f || {};
+    const cap = (s, n) => String(s == null ? "" : s).slice(0, n);
+    const steps = (Array.isArray(f.steps) ? f.steps : []).slice(0, RUN_RECORD_MAX_STEPS).map((s) => ({
+      step: (s && s.step) | 0,
+      type: cap(s && s.type, 40),
+      target: cap(s && s.target, 200)
+    }));
+    const approvals = (Array.isArray(f.approvals) ? f.approvals : []).slice(0, 100).map((a) => ({
+      kind: cap(a && a.kind, 20),
+      target: cap(a && a.target, 200),
+      verdict: cap(a && a.verdict, 20)
+    }));
+    const filesChanged = (Array.isArray(f.filesChanged) ? f.filesChanged : []).slice(0, 200).map((c) => ({
+      path: cap(c && c.path, 300),
+      kind: cap(c && c.kind, 20)
+    }));
+    return {
+      kind: "ghostide-agent-run",
+      version: 1,
+      id: cap(f.id, 80),
+      mode: f.mode === "plan" ? "plan" : "act",
+      task: cap(f.task, 500),
+      planPath: f.planPath || null,
+      startedAt: f.startedAt || "",
+      endedAt: f.endedAt || "",
+      outcome: cap(f.outcome, 40),
+      summary: cap(f.summary, 500),
+      steps,
+      approvals,
+      filesChanged,
+      checkpoint: f.checkpoint || null,
+      skipped: (Array.isArray(f.skipped) ? f.skipped : []).slice(0, 100).map((p) => cap(p, 300))
+    };
+  }
+  window.__ghostRunReview = {
+    agentRunStamp,
+    makeAgentRunId,
+    runCheckpointPath,
+    planFilePath,
+    buildPlanFile,
+    planBodyFromFile,
+    splitRunOriginals,
+    runChangeKind,
+    parseUnifiedDiff,
+    reverseUnifiedHunk,
+    buildRunRecord,
+    RUN_CKPT_MAX_CHARS
+  };
+  function postRunRecord(fields) {
+    try {
+      postJson("/api/agent-runs", buildRunRecord(fields)).catch(() => {
+      });
+    } catch (e) {
+    }
+  }
   function agentPolicy() {
     try {
       return localStorage.getItem("ghostide-agent-policy") || "each";
@@ -43372,6 +45308,7 @@
   var AGENT_BATCHABLE = [
     "read",
     "search",
+    "semantic",
     "list",
     "todo",
     "stepdone",
@@ -43390,6 +45327,8 @@
       return { type: "read", path: m[1] };
     if (m = t2.match(/^SEARCH\s+(.+)$/))
       return { type: "search", query: m[1].trim() };
+    if (m = t2.match(/^SEMANTIC\s+(.+)$/))
+      return { type: "semantic", query: m[1].trim() };
     if (m = t2.match(/^LIST(?:\s+(\S+))?$/))
       return { type: "list", path: m[1] || "" };
     if (m = t2.match(/^TODO\s+(.+)$/))
@@ -43697,6 +45636,67 @@
     const deletions = new Set(opts.deletions || []);
     let todos = normalizeAgentTodos(opts.todos || []);
     let checkpoints = [];
+    const runId = makeAgentRunId(
+      /* @__PURE__ */ new Date(),
+      Math.random().toString(36).slice(2, 6)
+    );
+    const runStartedAt = (/* @__PURE__ */ new Date()).toISOString();
+    const runOriginals = {};
+    const runSkipped = [];
+    const runApprovals = [];
+    let runCkptPath = "";
+    async function persistRunCheckpoint() {
+      if (!Object.keys(runOriginals).length && !runSkipped.length) return;
+      const split = splitRunOriginals(
+        runOriginals,
+        [...deletions]
+      );
+      const payload = buildDiskCheckpoint(
+        task,
+        split.files,
+        split.deleted
+      );
+      payload.runId = runId;
+      payload.run = true;
+      payload.skipped = runSkipped.slice();
+      if (!runCkptPath) runCkptPath = runCheckpointPath(runId);
+      const cd = await postJson(
+        "/api/file",
+        {
+          path: runCkptPath,
+          content: JSON.stringify(payload)
+        }
+      );
+      if (cd.error) return;
+      const idx = ckptIndexLoad();
+      const entry = {
+        path: runCkptPath,
+        created: payload.created,
+        task: payload.task,
+        files: Object.keys(runOriginals),
+        run: true
+      };
+      const at = idx.findIndex((x) => x.path === runCkptPath);
+      if (at >= 0) idx[at] = entry;
+      else idx.unshift(entry);
+      ckptIndexSave(idx);
+    }
+    async function captureRunOriginal(path) {
+      if (path in runOriginals || runSkipped.includes(path)) return;
+      let content2 = null;
+      try {
+        const r = await fetch("/api/file?path=" + encodeURIComponent(path));
+        const d = await r.json();
+        if (!d.error) content2 = d.content;
+      } catch (e) {
+      }
+      if (content2 != null && (content2.length > RUN_CKPT_MAX_CHARS || content2.includes("\0"))) {
+        runSkipped.push(path);
+      } else {
+        runOriginals[path] = content2;
+      }
+      await persistRunCheckpoint();
+    }
     const policy = agentPolicy();
     let runAllowAll = policy === "all" || policy === "plan" && !!opts.plan;
     addMsg("YOU", "\u{1F916} " + task + (opts.plan ? "\n(following the approved plan)" : ""));
@@ -43729,6 +45729,9 @@
         );
         const ms = (d.matches || []).slice(0, 20);
         return "Search results for " + a.query + ":\n" + (ms.length ? ms.map((x) => x.path + ":" + x.line + " " + x.text).join("\n") : "(no matches)");
+      }
+      if (a.type === "semantic") {
+        return semanticForAgent(a.query);
       }
       if (a.type === "list") {
         const fr = await fetch("/api/files");
@@ -43936,7 +45939,7 @@
               "/api/mcp/tools",
               { server: s.name }
             );
-            for (const t2 of (td.tools || []).slice(0, 10))
+            for (const t2 of (td.tools || []).filter((x) => x.enabled !== false).slice(0, 10))
               lines.push("- MCP " + s.name + " " + t2.name + (t2.description ? " - " + String(t2.description).slice(0, 100) : ""));
           } catch (e) {
           }
@@ -44101,6 +46104,12 @@
         const ms = (d.matches || []).slice(0, 20);
         addMsg("SYSTEM", "\u{1F50E} SEARCH " + act.query + " - " + ms.length + " match(es)");
         messages.push({ role: "user", content: "Search results for " + act.query + ":\n" + (ms.length ? ms.map((x) => x.path + ":" + x.line + " " + x.text).join("\n") : "(no matches)") });
+      } else if (act.type === "semantic") {
+        addMsg("SYSTEM", "\u2726 SEMANTIC " + act.query);
+        messages.push({
+          role: "user",
+          content: await semanticForAgent(act.query)
+        });
       } else if (act.type === "list") {
         const fr = await fetch("/api/files");
         const fd = await fr.json();
@@ -44109,6 +46118,7 @@
         addMsg("SYSTEM", "\u{1F5C2} LIST " + (act.path || "(all)") + " - " + names.length + " file(s)");
         messages.push({ role: "user", content: "Files" + (act.path ? " under " + act.path : "") + ":\n" + names.slice(0, 120).join("\n") });
       } else if (act.type === "write") {
+        await captureRunOriginal(act.path);
         staged.set(act.path, act.content);
         deletions.delete(act.path);
         const note = await agentCheckOne(act.path, act.content);
@@ -44116,6 +46126,7 @@
         addMsg("SYSTEM", "\u270F\uFE0F WRITE " + act.path + " (staged - not saved)\n" + note);
         messages.push({ role: "user", content: "Staged " + act.path + ". " + staged.size + " file(s) staged. Automatic check: " + note + " Continue." });
       } else if (act.type === "edit") {
+        await captureRunOriginal(act.path);
         const base2 = await readForAgent(act.path);
         const r = applyEditPatch(base2, act.oldText, act.newText);
         if (!r.ok) {
@@ -44144,17 +46155,28 @@
           if (q.error) {
             messages.push({ role: "user", content: "Queueing that command failed: " + q.error + " Continue without it." });
           } else {
+            runApprovals.push({
+              kind: "run",
+              target: act.command,
+              verdict: "queued"
+            });
             addMsg("SYSTEM", "\u{1F4E5} RUN queued for approval (" + q.id + "): " + act.command);
             messages.push({ role: "user", content: "That command went to the Approve queue (" + q.id + ") and has NOT run. The user decides in Tools > Approve queue. Continue without its output, or finish with DONE." });
           }
           continue;
         }
+        const wasAuto = runAllowAll;
         let verdict = runAllowAll ? "all" : await agentApproveRunUi(act.command);
         if (verdict === "all") runAllowAll = true;
         if (agentStop) {
           outcome = "stopped";
           break;
         }
+        runApprovals.push({
+          kind: "run",
+          target: act.command,
+          verdict: verdict === "deny" ? "denied" : wasAuto ? "auto" : verdict === "all" ? "granted-all" : "granted"
+        });
         if (verdict === "deny") {
           addMsg("SYSTEM", "\u26D4 RUN denied by you: " + act.command);
           messages.push({ role: "user", content: "The user denied that command. Do not retry it; find another way or finish with DONE." });
@@ -44180,11 +46202,17 @@
           if (q.error) {
             messages.push({ role: "user", content: "Queueing that deletion failed: " + q.error + " Continue without it." });
           } else {
+            runApprovals.push({
+              kind: "delete",
+              target: act.path,
+              verdict: "queued"
+            });
             addMsg("SYSTEM", "\u{1F4E5} DELETE queued for approval (" + q.id + "): " + act.path);
             messages.push({ role: "user", content: "Deletion of " + act.path + " went to the Approve queue (" + q.id + ") and has NOT happened. The user decides in Tools > Approve queue. Continue." });
           }
           continue;
         }
+        await captureRunOriginal(act.path);
         staged.delete(act.path);
         deletions.add(act.path);
         snapshot("DELETE " + act.path, step);
@@ -44217,6 +46245,26 @@
             role: "user",
             content: await agentToolText(act)
           });
+        } else if (act._d8why = await mcpRunRefusal(act)) {
+          const why = act._d8why;
+          runApprovals.push({
+            kind: "mcp",
+            target: act.server + "." + act.tool,
+            verdict: "disabled"
+          });
+          addMsg("SYSTEM", "\u26D4 MCP call refused: " + act.server + "." + act.tool + " - " + why);
+          messages.push({ role: "user", content: "That MCP call was refused: " + why + " Do not retry it; find another way or finish with DONE." });
+        } else if (policy !== "queue" && await mcpRunAllowed(act)) {
+          runApprovals.push({
+            kind: "mcp",
+            target: act.server + "." + act.tool,
+            verdict: "allowed"
+          });
+          const t2 = await agentToolText(act);
+          messages.push({
+            role: "user",
+            content: t2 + "\nContinue."
+          });
         } else if (policy === "queue") {
           const q = await postJson(
             "/api/approve/enqueue",
@@ -44233,6 +46281,11 @@
           if (q.error) {
             messages.push({ role: "user", content: "Queueing that MCP call failed: " + q.error + " Continue without it." });
           } else {
+            runApprovals.push({
+              kind: "mcp",
+              target: act.server + "." + act.tool,
+              verdict: "queued"
+            });
             addMsg("SYSTEM", "\u{1F4E5} MCP call queued for approval (" + q.id + "): " + act.server + "." + act.tool);
             messages.push({ role: "user", content: "That MCP call went to the Approve queue (" + q.id + ") and has NOT run. The user decides in Tools > Approve queue. Continue without its result, or finish with DONE." });
           }
@@ -44243,6 +46296,11 @@
             outcome = "stopped";
             break;
           }
+          runApprovals.push({
+            kind: "mcp",
+            target: act.server + "." + act.tool,
+            verdict: verdict === "deny" ? "denied" : verdict === "all" ? "granted-all" : "granted"
+          });
           if (verdict === "deny") {
             addMsg("SYSTEM", "\u26D4 MCP call denied by you: " + act.server + "." + act.tool);
             messages.push({ role: "user", content: "The user denied that MCP call. Do not retry it; find another way or finish with DONE." });
@@ -44254,6 +46312,11 @@
             });
           }
         } else {
+          runApprovals.push({
+            kind: "mcp",
+            target: act.server + "." + act.tool,
+            verdict: "auto"
+          });
           const t2 = await agentToolText(act);
           messages.push({
             role: "user",
@@ -44308,6 +46371,30 @@
         target: repairs + " repair round(s)"
       });
     saveTrail(task, trail, (Date.now() - agentT0) / 1e3);
+    const runFilesChanged = [];
+    for (const p of staged.keys())
+      runFilesChanged.push({
+        path: p,
+        kind: runChangeKind(p, runOriginals, [...deletions])
+      });
+    for (const p of deletions)
+      if (!staged.has(p))
+        runFilesChanged.push({ path: p, kind: "deleted" });
+    postRunRecord({
+      id: runId,
+      mode: "act",
+      task,
+      planPath: opts.planPath || null,
+      startedAt: runStartedAt,
+      endedAt: (/* @__PURE__ */ new Date()).toISOString(),
+      outcome,
+      summary: summary || "",
+      steps: trail.filter((t2) => t2.step > 0),
+      approvals: runApprovals,
+      filesChanged: runFilesChanged,
+      checkpoint: runCkptPath || null,
+      skipped: runSkipped
+    });
     sendBtn.textContent = "Send";
     sendBtn.onclick = oldSend;
     agentRunning = false;
@@ -44333,7 +46420,11 @@
         deletions,
         checkpoints,
         todos,
-        task
+        task,
+        runId,
+        runCkptPath: runCkptPath || "",
+        runOriginals,
+        runSkipped
       });
     } else if (outcome === "done") {
       agentActiveClear();
@@ -44362,6 +46453,12 @@
     agentPillShow("\u{1F4DD} Planning: " + task.slice(0, 50));
     const trail = [];
     const planT0 = Date.now();
+    const planRunId = makeAgentRunId(
+      /* @__PURE__ */ new Date(),
+      Math.random().toString(36).slice(2, 6)
+    );
+    const planStartedAt = (/* @__PURE__ */ new Date()).toISOString();
+    let planPath = "";
     let todos = [];
     addMsg("YOU", "\u{1F4DD} Plan: " + task);
     const sendBtn = $("chatSend");
@@ -44409,6 +46506,7 @@
         [
           "read",
           "search",
+          "semantic",
           "list",
           "todo",
           "reverse",
@@ -44435,6 +46533,8 @@
             );
             const ms = (d.matches || []).slice(0, 20);
             parts.push("Search results for " + a.query + ":\n" + (ms.length ? ms.map((x) => x.path + ":" + x.line + " " + x.text).join("\n") : "(no matches)"));
+          } else if (a.type === "semantic") {
+            parts.push(await semanticForAgent(a.query));
           } else if (a.type === "list") {
             const fr = await fetch("/api/files");
             const fd = await fr.json();
@@ -44473,6 +46573,11 @@
         const d = await postJson("/api/search", { query: act.query });
         const ms = (d.matches || []).slice(0, 20);
         messages.push({ role: "user", content: "Search results for " + act.query + ":\n" + (ms.length ? ms.map((x) => x.path + ":" + x.line + " " + x.text).join("\n") : "(no matches)") });
+      } else if (act.type === "semantic") {
+        messages.push({
+          role: "user",
+          content: await semanticForAgent(act.query)
+        });
       } else if (act.type === "list") {
         const fr = await fetch("/api/files");
         const fd = await fr.json();
@@ -44526,25 +46631,56 @@
     agentRunning = false;
     if (outcome === "done") {
       try {
+        planPath = planFilePath(/* @__PURE__ */ new Date());
+        const pd = await postJson(
+          "/api/file",
+          {
+            path: planPath,
+            content: buildPlanFile(
+              task,
+              planText,
+              todos,
+              /* @__PURE__ */ new Date()
+            )
+          }
+        );
+        if (pd.error) planPath = "";
+      } catch (e) {
+        planPath = "";
+      }
+      try {
         localStorage.setItem(
           "ghostide-agent2-plan",
           JSON.stringify({
             task,
             plan: planText,
             todos,
+            planPath,
             ts: Date.now()
           })
         );
       } catch (e) {
       }
-      const body = addMsg("GHOST", "\u{1F4DD} Plan ready: " + (summary || task) + "\n\n" + planText + "\n\nSteps:\n" + (todos.length ? todos.map((t2, i2) => i2 + 1 + ". " + t2.text).join("\n") : "(no steps recorded)"));
+      const body = addMsg("GHOST", "\u{1F4DD} Plan ready: " + (summary || task) + "\n\n" + planText + "\n\nSteps:\n" + (todos.length ? todos.map((t2, i2) => i2 + 1 + ". " + t2.text).join("\n") : "(no steps recorded)") + (planPath ? "\n\nSaved as " + planPath + " - you can open and edit that file; acting on the plan uses the file's current text." : ""));
       const row = document.createElement("div");
       row.className = "optRow";
       const actBtn = document.createElement("button");
       actBtn.textContent = "\u{1F916} Act on this plan";
-      actBtn.onclick = () => {
+      actBtn.onclick = async () => {
         row.remove();
-        runAgent(task, { plan: planText, todos });
+        let effective = planText;
+        if (planPath) {
+          try {
+            const r = await fetch("/api/file?path=" + encodeURIComponent(planPath));
+            const d = await r.json();
+            if (!d.error && d.content) {
+              const bodyText = planBodyFromFile(d.content);
+              if (bodyText) effective = bodyText;
+            }
+          } catch (e) {
+          }
+        }
+        runAgent(task, { plan: effective, todos, planPath });
       };
       const disBtn = document.createElement("button");
       disBtn.textContent = "Discard plan";
@@ -44558,6 +46694,21 @@
     } else if (outcome === "stopped") {
       addMsg("SYSTEM", "Planning stopped. Nothing was changed.");
     }
+    postRunRecord({
+      id: planRunId,
+      mode: "plan",
+      task,
+      planPath: planPath || null,
+      startedAt: planStartedAt,
+      endedAt: (/* @__PURE__ */ new Date()).toISOString(),
+      outcome,
+      summary: summary || "",
+      steps: trail.filter((t2) => t2.step > 0),
+      approvals: [],
+      filesChanged: [],
+      checkpoint: null,
+      skipped: []
+    });
     agentPillHide();
     notifyDone(
       "Plan finished",
@@ -44613,33 +46764,55 @@
           return null;
         }
       }
-      for (const p of approved) originals[p] = await originalOf(p);
+      const runOriginals = review.runOriginals || {};
+      for (const p of approved)
+        originals[p] = p in runOriginals ? runOriginals[p] : await originalOf(p);
       for (const p of approvedDel)
-        deletedOriginals[p] = await originalOf(p);
+        deletedOriginals[p] = p in runOriginals ? runOriginals[p] : await originalOf(p);
       let ckptPath = "";
       if (approved.size || approvedDel.size) {
-        ckptPath = checkpointFileName(/* @__PURE__ */ new Date());
         const payload = buildDiskCheckpoint(
           review.task || "",
           originals,
           deletedOriginals
         );
+        if (review.runCkptPath) {
+          ckptPath = review.runCkptPath;
+          for (const [p, c] of Object.entries(runOriginals)) {
+            if ((review.deletions || /* @__PURE__ */ new Set()).has(p)) {
+              if (!(p in payload.deleted))
+                payload.deleted[p] = c;
+            } else if (!(p in payload.files)) {
+              payload.files[p] = c;
+            }
+          }
+          payload.runId = review.runId || null;
+          payload.run = true;
+          payload.skipped = (review.runSkipped || []).slice();
+        } else {
+          ckptPath = checkpointFileName(/* @__PURE__ */ new Date());
+        }
         const cd = await postJson(
           "/api/file",
           { path: ckptPath, content: JSON.stringify(payload) }
         );
         if (!cd.error) {
           const idx = ckptIndexLoad();
-          idx.unshift({
+          const entry = {
             path: ckptPath,
             created: payload.created,
             task: payload.task,
-            files: Object.keys(originals).concat(Object.keys(deletedOriginals))
-          });
+            files: Object.keys(payload.files).concat(Object.keys(payload.deleted)),
+            run: !!payload.run
+          };
+          const at = idx.findIndex((x) => x.path === ckptPath);
+          if (at >= 0) idx[at] = entry;
+          else idx.unshift(entry);
           ckptIndexSave(idx);
         } else ckptPath = "";
       }
       let n = 0;
+      const appliedChanges = [];
       for (const [p, c] of staged) {
         if (!approved.has(p)) continue;
         const d = await postJson(
@@ -44648,6 +46821,10 @@
         );
         if (!d.error) {
           n++;
+          appliedChanges.push({
+            path: p,
+            kind: originals[p] == null ? "created" : "modified"
+          });
           if (p === currentFile) await reloadCurrentFromDisk();
           else if (tabStates.has(p)) tabStates.delete(p);
         }
@@ -44655,7 +46832,10 @@
       let nd = 0;
       for (const p of approvedDel) {
         const d = await postJson("/api/file/delete", { path: p });
-        if (d && !d.error) nd++;
+        if (d && !d.error) {
+          nd++;
+          appliedChanges.push({ path: p, kind: "deleted" });
+        }
       }
       loadFiles();
       addMsg("SYSTEM", "Agent changes applied: " + n + " file(s) saved" + (nd ? ", " + nd + " deleted" : "") + (ckptPath ? ". Undo point saved: " + ckptPath + " (Chat options: Checkpoints)." : "."));
@@ -44672,6 +46852,14 @@
         }
       } catch (e) {
       }
+      if (ckptPath && appliedChanges.length)
+        openRunReview({
+          task: review.task || "",
+          runId: review.runId || null,
+          ckptPath,
+          changes: appliedChanges,
+          skipped: (review.runSkipped || []).slice()
+        });
     };
     refreshApply();
     box.appendChild(applyRow);
@@ -44789,6 +46977,240 @@
     if (currentFile) await reloadCurrentFromDisk();
     addMsg("SYSTEM", "Checkpoint restored: " + n + " file(s) returned to their pre-apply state (" + (payload.task || "agent task") + ").");
   }
+  async function openRunReview(ctx) {
+    const box = $("todoResults");
+    $("todoTitle").textContent = "\u{1F9FE} Run review - keep or undo per file";
+    box.textContent = "";
+    const loadEl = document.createElement("div");
+    loadEl.className = "dim";
+    loadEl.textContent = "Loading the run checkpoint\u2026";
+    box.appendChild(loadEl);
+    $("todoPanel").classList.remove("hidden");
+    let payload = null;
+    try {
+      const r = await fetch("/api/file?path=" + encodeURIComponent(ctx.ckptPath));
+      const d = await r.json();
+      if (!d.error && d.content)
+        payload = JSON.parse(d.content);
+    } catch (e) {
+    }
+    if (!payload || payload.kind !== "ghostide-checkpoint") {
+      box.textContent = "";
+      const el = document.createElement("div");
+      el.className = "dim";
+      el.textContent = "The run checkpoint is missing (" + ctx.ckptPath + "), so per-file undo is not available for this run.";
+      box.appendChild(el);
+      return;
+    }
+    payload.files = payload.files || {};
+    payload.deleted = payload.deleted || {};
+    const state = /* @__PURE__ */ new Map();
+    for (const c of ctx.changes || []) {
+      let original;
+      if (c.path in payload.deleted)
+        original = payload.deleted[c.path];
+      else if (c.path in payload.files)
+        original = payload.files[c.path];
+      else continue;
+      state.set(c.path, { kind: c.kind, original, done: "" });
+    }
+    const skipped = ctx.skipped && ctx.skipped.length ? ctx.skipped : payload.skipped || [];
+    async function savePayload() {
+      const left = Object.keys(payload.files).length + Object.keys(payload.deleted).length;
+      if (!left) {
+        await postJson(
+          "/api/file/delete",
+          { path: ctx.ckptPath }
+        );
+        ckptIndexSave(ckptIndexLoad().filter((x) => x.path !== ctx.ckptPath));
+        return;
+      }
+      await postJson(
+        "/api/file",
+        {
+          path: ctx.ckptPath,
+          content: JSON.stringify(payload)
+        }
+      );
+    }
+    function dropEntry(p) {
+      delete payload.files[p];
+      delete payload.deleted[p];
+    }
+    async function refreshEditor(p) {
+      if (p === currentFile) await reloadCurrentFromDisk();
+      else if (tabStates.has(p)) tabStates.delete(p);
+      loadFiles();
+    }
+    async function currentOf(p) {
+      try {
+        const r = await fetch("/api/file?path=" + encodeURIComponent(p));
+        const d = await r.json();
+        return d.error ? "" : d.content || "";
+      } catch (e) {
+        return "";
+      }
+    }
+    async function keepFile(p) {
+      const e = state.get(p);
+      if (!e || e.done) return;
+      dropEntry(p);
+      await savePayload();
+      e.done = "kept";
+      addMsg("SYSTEM", "Kept " + p + " - its undo point is dropped.");
+      render();
+    }
+    async function undoFile(p) {
+      const e = state.get(p);
+      if (!e || e.done) return;
+      let ok = false;
+      if (e.kind === "created") {
+        const d = await postJson(
+          "/api/file/delete",
+          { path: p }
+        );
+        ok = !!(d && !d.error);
+      } else {
+        const d = await postJson(
+          "/api/file",
+          { path: p, content: e.original }
+        );
+        ok = !!(d && !d.error);
+      }
+      if (!ok) {
+        addMsg("SYSTEM", "Undo failed for " + p + ".");
+        return;
+      }
+      dropEntry(p);
+      await savePayload();
+      e.done = "undone";
+      await refreshEditor(p);
+      addMsg("SYSTEM", "Undid " + p + " - restored from the run checkpoint.");
+      render();
+    }
+    async function undoHunk(p, hunk, host) {
+      const e = state.get(p);
+      if (!e || e.done) return;
+      const current = await currentOf(p);
+      const r = reverseUnifiedHunk(current, hunk);
+      if (!r.ok) {
+        addMsg("SYSTEM", "Hunk undo refused for " + p + ": " + r.error);
+        return;
+      }
+      const d = await postJson(
+        "/api/file",
+        { path: p, content: r.content }
+      );
+      if (d.error) {
+        addMsg("SYSTEM", "Hunk undo failed for " + p + ".");
+        return;
+      }
+      await refreshEditor(p);
+      if (r.content === e.original) {
+        dropEntry(p);
+        await savePayload();
+        e.done = "undone";
+        addMsg("SYSTEM", "Undid " + p + " - every hunk reversed, file is back to its pre-run content.");
+        render();
+      } else {
+        addMsg("SYSTEM", "One hunk of " + p + " undone.");
+        await showHunks(p, host);
+      }
+    }
+    async function showHunks(p, host) {
+      const e = state.get(p);
+      host.textContent = "";
+      const wait = document.createElement("div");
+      wait.className = "dim";
+      wait.textContent = "Computing diff\u2026";
+      host.appendChild(wait);
+      const current = await currentOf(p);
+      const d = await postJson(
+        "/api/diff-text",
+        {
+          path: p,
+          base: e.original == null ? "" : e.original,
+          content: current
+        }
+      );
+      pendingRefactor = null;
+      $("diffApply").classList.add("hidden");
+      $("diffDiscard").classList.add("hidden");
+      $("diffTitle").textContent = "Run diff: " + p + " (checkpoint -> now)";
+      $("diffOut").textContent = d.diff || "(no differences)";
+      $("diffPanel").classList.remove("hidden");
+      host.textContent = "";
+      const hunks = parseUnifiedDiff(d.diff || "");
+      if (!hunks.length) {
+        const el = document.createElement("div");
+        el.className = "dim";
+        el.textContent = "   (no hunks - the file matches its checkpoint)";
+        host.appendChild(el);
+        return;
+      }
+      for (const h of hunks) {
+        const row = document.createElement("div");
+        row.className = "findRow";
+        row.textContent = "   \u21A9 undo hunk @@ -" + h.oldStart + "," + h.oldCount + " +" + h.newStart + "," + h.newCount + " @@";
+        row.onclick = () => undoHunk(p, h, host);
+        host.appendChild(row);
+      }
+    }
+    function render() {
+      box.textContent = "";
+      const head = document.createElement("div");
+      head.className = "dim";
+      head.textContent = "Run: " + (ctx.task || "agent task") + ". Keep drops a file's undo point; Undo restores the pre-run content from " + ctx.ckptPath + ".";
+      box.appendChild(head);
+      const pending = [...state.entries()].filter(([, e]) => !e.done);
+      if (pending.length > 1) {
+        const all = document.createElement("div");
+        all.className = "findRow";
+        all.textContent = "\u21A9 UNDO ALL (" + pending.length + " file(s) still pending)";
+        all.onclick = async () => {
+          for (const [p] of pending) await undoFile(p);
+        };
+        box.appendChild(all);
+      }
+      if (skipped.length) {
+        const sk = document.createElement("div");
+        sk.className = "dim";
+        sk.textContent = "Not covered by undo (too large or binary when the run touched them): " + skipped.join(", ");
+        box.appendChild(sk);
+      }
+      if (!state.size) {
+        const el = document.createElement("div");
+        el.className = "dim";
+        el.textContent = "Nothing left to review - every change was kept or undone.";
+        box.appendChild(el);
+      }
+      for (const [p, e] of state) {
+        const row = document.createElement("div");
+        row.className = "findRow";
+        row.textContent = (e.done === "kept" ? "\u2713 kept: " : e.done === "undone" ? "\u21A9 undone: " : e.kind === "created" ? "\uFF0B created: " : e.kind === "deleted" ? "\u{1F5D1} deleted: " : "\u270F\uFE0F modified: ") + p;
+        box.appendChild(row);
+        if (e.done) continue;
+        const diffRow = document.createElement("div");
+        diffRow.className = "findRow";
+        diffRow.textContent = "   \u{1F441} diff + hunks for " + p;
+        const host = document.createElement("div");
+        diffRow.onclick = () => showHunks(p, host);
+        box.appendChild(diffRow);
+        box.appendChild(host);
+        const keepRow = document.createElement("div");
+        keepRow.className = "findRow";
+        keepRow.textContent = "   \u2713 KEEP " + p;
+        keepRow.onclick = () => keepFile(p);
+        box.appendChild(keepRow);
+        const undoRow = document.createElement("div");
+        undoRow.className = "findRow";
+        undoRow.textContent = "   \u21A9 UNDO " + p;
+        undoRow.onclick = () => undoFile(p);
+        box.appendChild(undoRow);
+      }
+    }
+    render();
+  }
   function openCheckpointsPanel() {
     $("todoTitle").textContent = "\u{1F5C2} Agent checkpoints";
     const box = $("todoResults");
@@ -44821,7 +47243,72 @@
         openCheckpointsPanel();
       };
       box.appendChild(drow);
+      if (entry.path.includes("ckpt-run-")) {
+        const vrow = document.createElement("div");
+        vrow.className = "findRow";
+        vrow.textContent = "   \u{1F9FE} Review run changes (keep / undo per file)";
+        vrow.onclick = async () => {
+          let payload = null;
+          try {
+            const r = await fetch("/api/file?path=" + encodeURIComponent(entry.path));
+            const d = await r.json();
+            if (!d.error && d.content)
+              payload = JSON.parse(d.content);
+          } catch (e) {
+          }
+          const changes = [];
+          if (payload) {
+            for (const [p, c] of Object.entries(payload.files || {}))
+              changes.push({
+                path: p,
+                kind: c == null ? "created" : "modified"
+              });
+            for (const p of Object.keys(payload.deleted || {}))
+              changes.push({ path: p, kind: "deleted" });
+          }
+          openRunReview({
+            task: entry.task || "",
+            ckptPath: entry.path,
+            changes,
+            skipped: payload && payload.skipped || []
+          });
+        };
+        box.appendChild(vrow);
+      }
     }
+    const runsHead = document.createElement("div");
+    runsHead.className = "dim";
+    runsHead.textContent = "\u{1F916} Recent agent runs";
+    box.appendChild(runsHead);
+    const runsBox = document.createElement("div");
+    const runsWait = document.createElement("div");
+    runsWait.className = "dim";
+    runsWait.textContent = "Loading run records\u2026";
+    runsBox.appendChild(runsWait);
+    box.appendChild(runsBox);
+    fetch("/api/agent-runs").then((r) => r.json()).then((d) => {
+      runsBox.textContent = "";
+      const runs = d && d.runs || [];
+      if (!runs.length) {
+        const el = document.createElement("div");
+        el.className = "dim";
+        el.textContent = "No run records yet. One is saved each time an agent or plan run ends.";
+        runsBox.appendChild(el);
+        return;
+      }
+      for (const run of runs.slice(0, 10)) {
+        const row = document.createElement("div");
+        row.className = "findRow";
+        row.textContent = (run.mode === "plan" ? "\u{1F4DD} " : "\u{1F916} ") + (run.endedAt || run.startedAt || "") + " - " + (run.task || "agent task") + " (" + (run.outcome || "?") + ", " + run.files + " file(s))";
+        runsBox.appendChild(row);
+      }
+    }).catch(() => {
+      runsBox.textContent = "";
+      const el = document.createElement("div");
+      el.className = "dim";
+      el.textContent = "Run records unavailable.";
+      runsBox.appendChild(el);
+    });
     $("todoPanel").classList.remove("hidden");
   }
   var testDefLines = {};
