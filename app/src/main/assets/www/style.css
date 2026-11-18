@@ -1126,3 +1126,49 @@ input:focus, select:focus, textarea:focus {
     text-overflow: ellipsis; white-space: nowrap;
   }
 }
+
+/* ---------- Mobile Cycle 1 (M3): symbol row + touch
+   targets ----
+   The symbol row is an in-flow child of the editor
+   column: it takes its height from the editor, never
+   overlays it, and shows only while the editor holds
+   focus (the JS toggles .hidden; above phone widths
+   it does not exist at all). Inside its own box it
+   scrolls sideways; the page never does. Restraint
+   is deliberate: one slim row, not a second keyboard. */
+#symbolRow { display: none; }
+@media (max-width: 900px) {
+  #symbolRow {
+    display: flex; flex: none; gap: 4px;
+    align-items: center;
+    overflow-x: auto; overflow-y: hidden;
+    padding: 4px 6px; background: var(--panel-2);
+    border-top: 1px solid var(--line);
+    scrollbar-width: none;
+  }
+  #symbolRow.hidden { display: none; }
+  #symbolRow::-webkit-scrollbar { display: none; }
+  .symKey {
+    flex: none; min-width: 40px; height: 40px;
+    padding: 0 9px; font-size: 15px;
+    font-family: ui-monospace, monospace;
+    display: inline-flex; align-items: center;
+    justify-content: center;
+  }
+  /* Touch pass: the editor-adjacent controls that
+     measured under a 40px target (tab close buttons,
+     view bar items, panel header buttons, Git row
+     buttons) reach a 40px minimum height on phone
+     widths. Hit area only: no visual redesign, and
+     nothing in this block applies above 900px. */
+  .tab { min-height: 40px; }
+  .tabClose {
+    min-width: 40px; min-height: 40px;
+    display: inline-flex; align-items: center;
+    justify-content: center;
+  }
+  #viewBar button { min-height: 40px; }
+  .panel-head button { min-height: 40px; }
+  .gitRow button, .hunkHead button,
+  .conflictRow button { min-height: 40px; }
+}

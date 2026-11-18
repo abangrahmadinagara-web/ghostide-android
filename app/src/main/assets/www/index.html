@@ -160,6 +160,7 @@ setTimeout(function () {
         <div id="editor2"></div>
       </div>
     </div>
+    <div id="symbolRow" class="hidden" role="toolbar" aria-label="Symbol row"></div>
     <div id="runPane" class="hidden">
       <div class="run-head"><span id="runTitle">Output</span>
         <span><button id="runSlice" title="GhostLogs: slice this output into an incident pack (error windows, duplicates collapsed)">🔪 Slice log</button>
@@ -1001,6 +1002,12 @@ setTimeout(function () {
     </select></label>
   <label><input type="checkbox" id="setBubbles"> Message bubbles</label>
   <label><input type="checkbox" id="setRoleLabels"> Show who labels (You / Ghost)</label>
+  <h4>PHONE</h4>
+  <label><input type="checkbox" id="setSymbolRow"> Symbol row while editing (phone widths: one slim row of code symbols docked under the editor)</label>
+  <label>Symbol row keys (space separated, in order; Tab, Undo, Left and Right are special keys, any other entry is typed as-is)
+    <input type="text" id="setSymbolKeys" spellcheck="false" autocomplete="off"></label>
+  <div class="optRow"><button id="setSymbolKeysReset" type="button">Reset symbol row keys to default</button></div>
+  <p class="dim">The row scrolls sideways inside itself, so put the keys you use most first. It only appears at phone widths while the editor has focus.</p>
   <h4>SETTINGS TOOLS</h4>
   <div class="optRow"><button id="setExportBtn">Export settings</button><button id="setImportBtn">Import settings</button><button id="setResetBtn">Reset all settings</button></div>
   <div id="appInfo" class="dim"></div>

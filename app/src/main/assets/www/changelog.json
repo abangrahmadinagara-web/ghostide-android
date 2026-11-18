@@ -3,6 +3,12 @@
  "kind": "changelog",
  "entries": [
   {
+   "version": "3.19.0",
+   "date": "Nov 17, 2026",
+   "goal": "Mobile Cycle 1 M3: slim configurable symbol row + touch-editing pass",
+   "summary": "Phone keyboards bury the characters code is made of, so a single slim row now docks under the editor at phone widths while it has focus: Tab, brackets, quotes and the everyday symbols in one row that scrolls sideways inside itself, plus Undo and cursor keys. Bracket and quote keys insert through the editor's own auto-close, so a pair lands with the cursor inside, and taps never dismiss the keyboard. The row is configurable in Settings, Phone: an on/off toggle and an editable, resettable key list. A touch pass also lifts tab close buttons, view bar items, panel header buttons and Git row buttons to a 40px minimum target on phones, and the viewport gate proves the row appears on focus, inserts, measures clean, and hides on blur."
+  },
+  {
    "version": "3.18.0",
    "date": "Nov 17, 2026",
    "goal": "Mobile Cycle 1 M1: viewport-matrix gate + phone layout hardening",

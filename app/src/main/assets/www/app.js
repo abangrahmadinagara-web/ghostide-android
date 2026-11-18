@@ -19891,6 +19891,12 @@
     view2.setTabFocusMode();
     return true;
   };
+  var insertTab = ({ state, dispatch }) => {
+    if (state.selection.ranges.some((r) => !r.empty))
+      return indentMore({ state, dispatch });
+    dispatch(state.update(state.replaceSelection("	"), { scrollIntoView: true, userEvent: "input" }));
+    return true;
+  };
   var emacsStyleKeymap = [
     { key: "Ctrl-b", run: cursorCharLeft, shift: selectCharLeft, preventDefault: true },
     { key: "Ctrl-f", run: cursorCharRight, shift: selectCharRight },
@@ -41234,6 +41240,176 @@
   $("handTools").onclick = () => $("toolsBtn").click();
   applyLang();
   applyAccess();
+  var SYMBOL_ROW_KEY = "ghostide-symbolrow";
+  var SYMBOL_SPECIALS = ["Tab", "Undo", "Left", "Right"];
+  var SYMBOL_DEFAULT_KEYS = [
+    "Tab",
+    "(",
+    ")",
+    "{",
+    "}",
+    "[",
+    "]",
+    ";",
+    ":",
+    "=",
+    ".",
+    ",",
+    "/",
+    '"',
+    "'",
+    "Undo",
+    "Left",
+    "Right"
+  ];
+  var SYMBOL_LABELS = {
+    Tab: "Tab",
+    Undo: "\u21A9",
+    Left: "\u2190",
+    Right: "\u2192"
+  };
+  var SYMBOL_ARIA = {
+    Tab: "Tab",
+    Undo: "Undo",
+    Left: "Cursor left",
+    Right: "Cursor right"
+  };
+  function symbolRowCleanKeys(arr) {
+    if (!Array.isArray(arr)) return null;
+    const keys2 = arr.filter((k) => typeof k === "string" && k.length >= 1 && k.length <= 12);
+    return keys2.length ? keys2 : null;
+  }
+  function symbolRowConfig() {
+    let cfg = {};
+    try {
+      cfg = JSON.parse(
+        localStorage.getItem(SYMBOL_ROW_KEY) || "{}"
+      ) || {};
+    } catch (e) {
+      cfg = {};
+    }
+    return {
+      enabled: cfg.enabled !== false,
+      keys: symbolRowCleanKeys(cfg.keys) || SYMBOL_DEFAULT_KEYS.slice()
+    };
+  }
+  function saveSymbolRowConfig(cfg) {
+    try {
+      localStorage.setItem(SYMBOL_ROW_KEY, JSON.stringify({
+        enabled: !!cfg.enabled,
+        keys: symbolRowCleanKeys(cfg.keys) || SYMBOL_DEFAULT_KEYS.slice()
+      }));
+    } catch (e) {
+    }
+  }
+  function symbolRowParseField(text) {
+    return symbolRowCleanKeys(
+      String(text || "").split(/\s+/).filter(Boolean)
+    );
+  }
+  function symbolRowInsert(v, key) {
+    if (!v || typeof key !== "string" || !key) return false;
+    if (key === "Tab") return insertTab(v);
+    if (key === "Undo") return undo(v);
+    if (key === "Left") return cursorCharLeft(v);
+    if (key === "Right") return cursorCharRight(v);
+    if (key.length === 1) {
+      const tr = insertBracket(v.state, key);
+      if (tr) {
+        v.dispatch(tr);
+        return true;
+      }
+    }
+    v.dispatch(v.state.replaceSelection(key));
+    return true;
+  }
+  try {
+    window.__ghostSymbolRow = {
+      SYMBOL_ROW_KEY,
+      SYMBOL_SPECIALS,
+      SYMBOL_DEFAULT_KEYS,
+      symbolRowConfig,
+      saveSymbolRowConfig,
+      symbolRowParseField,
+      symbolRowInsert
+    };
+  } catch (e) {
+  }
+  function renderSymbolRow() {
+    const row = $("symbolRow");
+    if (!row) return;
+    while (row.firstChild) row.removeChild(row.firstChild);
+    for (const key of symbolRowConfig().keys) {
+      const b = document.createElement("button");
+      b.type = "button";
+      b.className = "symKey";
+      b.tabIndex = -1;
+      b.dataset.key = key;
+      b.textContent = SYMBOL_LABELS[key] || key;
+      b.setAttribute("aria-label", SYMBOL_ARIA[key] || key);
+      b.title = SYMBOL_ARIA[key] || "Insert " + key;
+      row.appendChild(b);
+    }
+    updateSymbolRow();
+  }
+  function updateSymbolRow() {
+    const row = $("symbolRow");
+    if (!row) return;
+    row.classList.toggle(
+      "hidden",
+      !(symbolRowConfig().enabled && view.hasFocus)
+    );
+  }
+  function initSymbolRow() {
+    const row = $("symbolRow");
+    if (!row) return;
+    row.addEventListener("pointerdown", (e) => {
+      const b = e.target.closest("[data-key]");
+      if (!b) return;
+      e.preventDefault();
+      symbolRowInsert(view, b.dataset.key);
+      view.focus();
+    });
+    row.addEventListener("mousedown", (e) => {
+      if (e.target.closest("[data-key]")) e.preventDefault();
+    });
+    view.dom.addEventListener("focusin", updateSymbolRow);
+    view.dom.addEventListener("focusout", () => setTimeout(updateSymbolRow, 0));
+    const tgl = $("setSymbolRow");
+    if (tgl) {
+      tgl.checked = symbolRowConfig().enabled;
+      tgl.onchange = (e) => {
+        const cfg = symbolRowConfig();
+        cfg.enabled = e.target.checked;
+        saveSymbolRowConfig(cfg);
+        updateSymbolRow();
+      };
+    }
+    const fld = $("setSymbolKeys");
+    if (fld) {
+      fld.value = symbolRowConfig().keys.join(" ");
+      fld.onchange = (e) => {
+        const keys2 = symbolRowParseField(e.target.value);
+        const cfg = symbolRowConfig();
+        if (keys2) {
+          cfg.keys = keys2;
+          saveSymbolRowConfig(cfg);
+        }
+        e.target.value = symbolRowConfig().keys.join(" ");
+        renderSymbolRow();
+      };
+    }
+    const rst = $("setSymbolKeysReset");
+    if (rst) rst.onclick = () => {
+      const cfg = symbolRowConfig();
+      cfg.keys = SYMBOL_DEFAULT_KEYS.slice();
+      saveSymbolRowConfig(cfg);
+      if (fld) fld.value = cfg.keys.join(" ");
+      renderSymbolRow();
+    };
+    renderSymbolRow();
+  }
+  initSymbolRow();
   $("setDelay").value = settings.infillDelay;
   $("setDelay").onchange = (e) => {
     const n = parseInt(e.target.value, 10);
